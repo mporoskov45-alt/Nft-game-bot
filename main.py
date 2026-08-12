@@ -1,2143 +1,1413 @@
-import asyncio
-import logging
 import os
+import json
 import random
-from datetime import datetime
+import time
+import threading
+from typing import Optional
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    Integer,
-    String,
-    Text,
-    func,
-    select,
-    text,
-)
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import telebot
+from telebot import types
 
 
 # ============================================================
-# НАСТРОЙКИ
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-API_HOST = os.getenv(
-    "API_HOST",
-    "http://31.76.20.193:8081",
-).strip()
-
-
-# Цены кейсов
-BILETER_PRICE = 100
-LUXURY_PRICE = 2000
-
-# Укажи цену Наркомана через Railway Variables:
-# NARKOMAN_PRICE=100
-NARKOMAN_PRICE = int(
-    os.getenv("NARKOMAN_PRICE", "100")
-)
-COLOR_PRICE = 100
-
-
-# ============================================================
-# АДМИНЫ
-# ============================================================
-
-ADMIN_IDS = {
-    1780243345,
-    1780243308,
+ADMINS = {
     1780243378,
+    1780243308,
+    1780243345,
 }
 
-
-# ============================================================
-# ПРОВЕРКА НАСТРОЕК
-# ============================================================
+TOP_UP_CONTACTS = ["@doxme", "@modeevil", "@bogkm"]
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "Не задан BOT_TOKEN"
-    )
-
+    raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
-    raise RuntimeError(
-        "Не задан DATABASE_URL"
-    )
+    raise RuntimeError("DATABASE_URL is not set")
 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 
-# Railway иногда отдаёт postgres://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://",
-        "postgresql+asyncpg://",
-        1,
-    )
+# user_id -> state dict
+states = {}
+state_lock = threading.RLock()
 
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgresql://",
-        "postgresql+asyncpg://",
-        1,
-    )
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(message)s"
-    ),
-)
+# Prevent double-click / concurrent case opening.
+user_locks = {}
+user_locks_lock = threading.Lock()
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=300,
-)
-
-SessionLocal = async_sessionmaker(
-    engine,
-    expire_on_commit=False,
-)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-# ============================================================
-# USER
-# ============================================================
-
-class User(Base):
-
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(
-        BigInteger,
-        primary_key=True,
-    )
-
-    username: Mapped[str | None] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-
-    first_name: Mapped[str | None] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-
-    balance: Mapped[int] = mapped_column(
-        BigInteger,
-        default=0,
-        nullable=False,
-    )
-
-    is_admin: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-        nullable=False,
+def db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10,
     )
 
 
-# ============================================================
-# CASE OPEN
-# ============================================================
+def init_db():
+    conn = db()
+    try:
+        cur = conn.cursor()
 
-class CaseOpen(Base):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT '',
+                stars BIGINT NOT NULL DEFAULT 0,
+                inventory TEXT NOT NULL DEFAULT '[]',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    __tablename__ = "case_opens"
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cases (
+                case_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                price BIGINT NOT NULL DEFAULT 0,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """)
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS opening_history (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                case_id TEXT NOT NULL,
+                case_name TEXT NOT NULL,
+                prize_name TEXT NOT NULL,
+                prize_type TEXT NOT NULL,
+                price BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        index=True,
-    )
+        default_cases = [
+            ("bileter", "🎫 Билетёр", 100, True),
+            ("risk", "🍬 Ириски и риски", 0, True),
+            ("luxury", "💎 Лакшери", 2000, True),
+            ("narkoman", "🥤 Наркоман", 100, True),
+            ("colors", "🔴🔵🟡 Цвет", 100, True),
+        ]
 
-    case_name: Mapped[str] = mapped_column(
-        String(100)
-    )
+        for item in default_cases:
+            cur.execute("""
+                INSERT INTO cases(case_id, name, price, enabled)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT(case_id) DO NOTHING
+            """, item)
 
-    price: Mapped[int] = mapped_column(
-        Integer
-    )
-
-    selected_color: Mapped[str | None] = mapped_column(
-        String(20),
-        nullable=True,
-    )
-
-    winning_color: Mapped[str | None] = mapped_column(
-        String(20),
-        nullable=True,
-    )
-
-    reward_name: Mapped[str] = mapped_column(
-        String(255)
-    )
-
-    reward_type: Mapped[str] = mapped_column(
-        String(50)
-    )
-
-    reward_value: Mapped[int] = mapped_column(
-        BigInteger,
-        default=0,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
-
-
-# ============================================================
-# INVENTORY
-# ============================================================
-
-class InventoryItem(Base):
-
-    __tablename__ = "inventory_items"
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        index=True,
-    )
-
-    item_name: Mapped[str] = mapped_column(
-        String(255)
-    )
-
-    item_type: Mapped[str] = mapped_column(
-        String(50)
-    )
-
-    source_case: Mapped[str] = mapped_column(
-        String(100)
-    )
-
-    status: Mapped[str] = mapped_column(
-        String(50),
-        default="pending",
-    )
-
-    admin_note: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
-# ============================================================
-# BALANCE LOG
-# ============================================================
+def ensure_user(user_id: int, username="", first_name=""):
+    conn = db()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-class BalanceLog(Base):
+        cur.execute("""
+            INSERT INTO users(user_id, username, first_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT(user_id)
+            DO UPDATE SET username=EXCLUDED.username,
+                          first_name=EXCLUDED.first_name
+            RETURNING *
+        """, (user_id, username or "", first_name or ""))
 
-    __tablename__ = "balance_logs"
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        index=True,
-    )
-
-    admin_id: Mapped[int | None] = mapped_column(
-        BigInteger,
-        nullable=True,
-    )
-
-    amount: Mapped[int] = mapped_column(
-        BigInteger
-    )
-
-    balance_after: Mapped[int] = mapped_column(
-        BigInteger
-    )
-
-    operation: Mapped[str] = mapped_column(
-        String(30)
-    )
-
-    note: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
+        user = cur.fetchone()
+        conn.commit()
+        cur.close()
+        return user
+    finally:
+        conn.close()
 
 
-# ============================================================
-# НАГРАДЫ
-# ============================================================
-
-# Вес = вероятность.
-# Никаких гарантированных наград нет.
-
-BILETER_REWARDS = [
-    (
-        "Обычный билет",
-        "balance",
-        980,
-        50,
-    ),
-    (
-        "Золотой билет",
-        "nft",
-        20,
-        0,
-    ),
-]
+def get_user(user_id: int):
+    conn = db()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.close()
+        return user
+    finally:
+        conn.close()
 
 
-LUXURY_REWARDS = [
-    (
-        "Wavegram Gift #1",
-        "gift",
-        350,
-        0,
-    ),
-    (
-        "Wavegram Gift #2",
-        "gift",
-        250,
-        0,
-    ),
-    (
-        "Wavegram Gift #3",
-        "gift",
-        180,
-        0,
-    ),
-    (
-        "Редкий Wavegram Gift",
-        "gift",
-        150,
-        0,
-    ),
-    (
-        "Очень редкий Wavegram Gift",
-        "gift",
-        70,
-        0,
-    ),
-]
+def get_balance(user_id: int) -> int:
+    user = get_user(user_id)
+    if not user:
+        ensure_user(user_id)
+        return 0
+    return int(user["stars"])
 
 
-NARKOMAN_REWARDS = [
-    (
-        "50 игровых ⭐",
-        "balance",
-        970,
-        50,
-    ),
-    (
-        "NFT Глазик",
-        "nft",
-        30,
-        0,
-    ),
-]
-
-
-def choose_reward(rewards):
-
-    return random.choices(
-        rewards,
-        weights=[
-            reward[2]
-            for reward in rewards
-        ],
-        k=1,
-    )[0]
-
-
-# ============================================================
-# TELEGRAM API
-# ============================================================
-
-telegram_api = TelegramAPIServer.from_base(
-    API_HOST
-)
-
-telegram_session = AiohttpSession(
-    api=telegram_api
-)
-
-bot = Bot(
-    token=BOT_TOKEN,
-    session=telegram_session,
-)
-
-dp = Dispatcher()
-
-
-# ============================================================
-# DATABASE MIGRATION
-# ============================================================
-
-async def migrate_database():
-
+def change_balance(user_id: int, amount: int, allow_negative=False):
     """
-    Исправляет старую таблицу users.
-
-    Основная проблема из логов:
-    users существует, но users.id отсутствует.
-
-    Эта функция:
-    - проверяет users;
-    - переименовывает user_id/telegram_id в id;
-    - либо создаёт id;
-    - добавляет отсутствующие колонки;
-    - создаёт остальные таблицы.
+    Atomic balance update.
+    Returns new balance or None if user doesn't exist / insufficient funds.
     """
+    conn = db()
+    try:
+        cur = conn.cursor()
 
-    async with engine.begin() as conn:
+        if allow_negative:
+            cur.execute("""
+                UPDATE users
+                SET stars = stars + %s
+                WHERE user_id=%s
+                RETURNING stars
+            """, (amount, user_id))
+        else:
+            cur.execute("""
+                UPDATE users
+                SET stars = stars + %s
+                WHERE user_id=%s AND stars + %s >= 0
+                RETURNING stars
+            """, (amount, user_id, amount))
 
-        # --------------------------------------------------------
-        # Список таблиц
-        # --------------------------------------------------------
+        result = cur.fetchone()
 
-        result = await conn.execute(
-            text("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = 'public'
-            """)
+        if not result:
+            conn.rollback()
+            return None
+
+        conn.commit()
+        return int(result[0])
+    finally:
+        conn.close()
+
+
+def get_inventory(user_id: int):
+    user = get_user(user_id)
+    if not user:
+        return []
+
+    try:
+        data = json.loads(user["inventory"] or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def add_inventory(user_id: int, item: dict):
+    conn = db()
+    try:
+        cur = conn.cursor()
+
+        cur.execute("SELECT inventory FROM users WHERE user_id=%s FOR UPDATE", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+
+        try:
+            inventory = json.loads(row[0] or "[]")
+            if not isinstance(inventory, list):
+                inventory = []
+        except Exception:
+            inventory = []
+
+        inventory.append(item)
+
+        cur.execute("""
+            UPDATE users
+            SET inventory=%s
+            WHERE user_id=%s
+        """, (json.dumps(inventory, ensure_ascii=False), user_id))
+
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_all_users():
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users ORDER BY user_id")
+        result = [int(row[0]) for row in cur.fetchall()]
+        cur.close()
+        return result
+    finally:
+        conn.close()
+
+
+def get_stats():
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM users")
+        users, stars = cur.fetchone()
+
+        cur.execute("SELECT COUNT(*) FROM opening_history")
+        openings = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM cases WHERE enabled=TRUE")
+        enabled_cases = cur.fetchone()[0]
+
+        cur.close()
+        return int(users), int(stars), int(openings), int(enabled_cases)
+    finally:
+        conn.close()
+
+
+# ============================================================
+# CASES / HISTORY
+# ============================================================
+
+def case_info(case_id):
+    conn = db()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM cases WHERE case_id=%s", (case_id,))
+        result = cur.fetchone()
+        cur.close()
+        return result
+    finally:
+        conn.close()
+
+
+def is_enabled(case_id):
+    case = case_info(case_id)
+    return bool(case and case["enabled"])
+
+
+def set_case_enabled(case_id, enabled):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE cases SET enabled=%s WHERE case_id=%s",
+            (bool(enabled), case_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_history(user_id, case, prize, price):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO opening_history(
+                user_id, case_id, case_name,
+                prize_name, prize_type, price
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            user_id,
+            case["case_id"],
+            case["name"],
+            prize["name"],
+            prize["type"],
+            price,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================================================
+# USER LOCK
+# ============================================================
+
+def get_user_lock(user_id):
+    with user_locks_lock:
+        if user_id not in user_locks:
+            user_locks[user_id] = threading.Lock()
+        return user_locks[user_id]
+
+
+# ============================================================
+# UI
+# ============================================================
+
+def main_keyboard(user_id):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+
+    kb.add(
+        types.InlineKeyboardButton("🎁 КЕЙСЫ", callback_data="cases"),
+        types.InlineKeyboardButton("👤 ПРОФИЛЬ", callback_data="profile"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🎒 ИНВЕНТАРЬ", callback_data="inventory"),
+        types.InlineKeyboardButton("⭐ ПОПОЛНИТЬ", callback_data="topup"),
+    )
+
+    if user_id in ADMINS:
+        kb.add(types.InlineKeyboardButton("👑 АДМИН-ПАНЕЛЬ", callback_data="admin"))
+
+    return kb
+
+
+def home_keyboard(user_id):
+    return main_keyboard(user_id)
+
+
+def back_keyboard(target="home"):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=target))
+    return kb
+
+
+def cases_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    for case_id in ["bileter", "risk", "luxury", "narkoman", "colors"]:
+        case = case_info(case_id)
+        if not case or not case["enabled"]:
+            continue
+
+        price = int(case["price"])
+        if case_id == "risk":
+            label = f"{case['name']} — 🎯 Ставка"
+        else:
+            label = f"{case['name']} — {price:,} ⭐".replace(",", " ")
+
+        kb.add(types.InlineKeyboardButton(
+            label,
+            callback_data=f"open:{case_id}"
+        ))
+
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="home"))
+    return kb
+
+
+def color_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("🔴", callback_data="color:red"),
+        types.InlineKeyboardButton("🔵", callback_data="color:blue"),
+        types.InlineKeyboardButton("🟡", callback_data="color:yellow"),
+    )
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cases"))
+    return kb
+
+
+def admin_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+
+    kb.add(
+        types.InlineKeyboardButton("⭐ Выдать", callback_data="admin:add"),
+        types.InlineKeyboardButton("➖ Снять", callback_data="admin:remove"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👤 Пользователь", callback_data="admin:user"),
+        types.InlineKeyboardButton("🎁 Кейсы", callback_data="admin:cases"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+        types.InlineKeyboardButton("📜 История", callback_data="admin:history"),
+    )
+    kb.add(types.InlineKeyboardButton("📢 Рассылка", callback_data="admin:broadcast"))
+    kb.add(types.InlineKeyboardButton("⬅️ Главное меню", callback_data="home"))
+    return kb
+
+
+def admin_cases_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    for case_id in ["bileter", "risk", "luxury", "narkoman", "colors"]:
+        case = case_info(case_id)
+        if not case:
+            continue
+
+        status = "🟢 ВКЛЮЧЕН" if case["enabled"] else "🔴 ВЫКЛЮЧЕН"
+        price = int(case["price"])
+
+        kb.add(types.InlineKeyboardButton(
+            f"{case['name']} • {price:,} ⭐ • {status}".replace(",", " "),
+            callback_data=f"toggle:{case_id}"
+        ))
+
+    kb.add(types.InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin"))
+    return kb
+
+
+# ============================================================
+# TEXT
+# ============================================================
+
+HOME_TEXT = """
+<b>🎁 CASES WAVEGRAM</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Добро пожаловать в кейс-сервис.
+
+🎁 Открывай кейсы
+⭐ Играй за звёзды
+🎒 Забирай призы в инвентарь
+
+Выбери раздел ниже 👇
+"""
+
+
+def profile_text(user_id):
+    user = get_user(user_id) or ensure_user(user_id)
+    inventory = get_inventory(user_id)
+    username = f"@{user['username']}" if user["username"] else "не указан"
+
+    return f"""
+<b>👤 ПРОФИЛЬ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🆔 ID: <code>{user_id}</code>
+👤 Username: {username}
+
+⭐ Баланс: <b>{int(user['stars']):,}</b>
+🎒 Предметов: <b>{len(inventory)}</b>
+""".replace(",", " ")
+
+
+def inventory_text(user_id):
+    inventory = get_inventory(user_id)
+
+    if not inventory:
+        return """
+<b>🎒 ИНВЕНТАРЬ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Пока пусто.
+
+Открывай кейсы и получай призы 🎁
+"""
+
+    text = "<b>🎒 ИНВЕНТАРЬ</b>\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, item in enumerate(inventory[-30:], 1):
+        text += (
+            f"<b>{i}.</b> {item.get('name', 'Предмет')}\n"
+            f"   └ {item.get('type', 'item')}\n\n"
         )
 
-        tables = {
-            row[0]
-            for row in result.fetchall()
+    return text
+
+
+def topup_text():
+    contacts = "\n".join(f"👤 {x}" for x in TOP_UP_CONTACTS)
+
+    return f"""
+<b>⭐ ПОПОЛНЕНИЕ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Для пополнения напиши продавцу:
+
+{contacts}
+
+После оплаты отправь продавцу свой Telegram ID.
+
+🆔 ID можно посмотреть в разделе «Профиль».
+"""
+
+
+# ============================================================
+# PRIZES
+# ============================================================
+
+def bileter_prize():
+    if random.random() < 0.02:
+        return {"name": "🥇 Золотой билет", "type": "NFT", "valuable": True}
+
+    return {
+        "name": "🎫 Обычный билет",
+        "type": "stars",
+        "stars": 50,
+        "valuable": False,
+    }
+
+
+def narkoman_prize():
+    if random.random() < 0.50:
+        return {
+            "name": "⭐ 50 звёзд",
+            "type": "stars",
+            "stars": 50,
+            "valuable": False,
         }
 
-        # --------------------------------------------------------
-        # USERS
-        # --------------------------------------------------------
-
-        if "users" in tables:
-
-            result = await conn.execute(
-                text("""
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                      AND table_name = 'users'
-                """)
-            )
-
-            columns = {
-                row[0]
-                for row in result.fetchall()
-            }
-
-            logging.info(
-                "Существующие колонки users: %s",
-                sorted(columns),
-            )
-
-            # ----------------------------------------------------
-            # user_id -> id
-            # ----------------------------------------------------
-
-            if (
-                "id" not in columns
-                and "user_id" in columns
-            ):
-
-                logging.warning(
-                    "Миграция users.user_id -> users.id"
-                )
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        RENAME COLUMN user_id TO id
-                    """)
-                )
-
-                columns.remove("user_id")
-                columns.add("id")
-
-            # ----------------------------------------------------
-            # telegram_id -> id
-            # ----------------------------------------------------
-
-            elif (
-                "id" not in columns
-                and "telegram_id" in columns
-            ):
-
-                logging.warning(
-                    "Миграция users.telegram_id -> users.id"
-                )
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        RENAME COLUMN telegram_id TO id
-                    """)
-                )
-
-                columns.remove("telegram_id")
-                columns.add("id")
-
-            # ----------------------------------------------------
-            # Если вообще нет ID
-            # ----------------------------------------------------
-
-            elif "id" not in columns:
-
-                logging.warning(
-                    "В users отсутствует ID."
-                )
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN id BIGINT
-                    """)
-                )
-
-                # Получаем существующие строки
-                result = await conn.execute(
-                    text("""
-                        SELECT ctid
-                        FROM users
-                        WHERE id IS NULL
-                    """)
-                )
-
-                rows = result.fetchall()
-
-                next_id = 1
-
-                for row in rows:
-
-                    await conn.execute(
-                        text("""
-                            UPDATE users
-                            SET id = :id
-                            WHERE ctid = :ctid
-                        """),
-                        {
-                            "id": next_id,
-                            "ctid": row[0],
-                        },
-                    )
-
-                    next_id += 1
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ALTER COLUMN id SET NOT NULL
-                    """)
-                )
-
-                # Проверяем primary key
-                result = await conn.execute(
-                    text("""
-                        SELECT constraint_name
-                        FROM information_schema.table_constraints
-                        WHERE table_schema = 'public'
-                          AND table_name = 'users'
-                          AND constraint_type = 'PRIMARY KEY'
-                    """)
-                )
-
-                has_pk = (
-                    result.first()
-                    is not None
-                )
-
-                if not has_pk:
-
-                    await conn.execute(
-                        text("""
-                            ALTER TABLE users
-                            ADD PRIMARY KEY (id)
-                        """)
-                    )
-
-            # ----------------------------------------------------
-            # Остальные колонки
-            # ----------------------------------------------------
-
-            if "username" not in columns:
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN username VARCHAR(255)
-                    """)
-                )
-
-            if "first_name" not in columns:
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN first_name VARCHAR(255)
-                    """)
-                )
-
-            if "balance" not in columns:
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN balance BIGINT
-                        NOT NULL DEFAULT 0
-                    """)
-                )
-
-            if "is_admin" not in columns:
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN is_admin BOOLEAN
-                        NOT NULL DEFAULT FALSE
-                    """)
-                )
-
-            if "created_at" not in columns:
-
-                await conn.execute(
-                    text("""
-                        ALTER TABLE users
-                        ADD COLUMN created_at TIMESTAMP
-                        NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    """)
-                )
-
-        # --------------------------------------------------------
-        # Остальные таблицы
-        # --------------------------------------------------------
-
-        await conn.run_sync(
-            Base.metadata.create_all
-        )
-
-    logging.info(
-        "PostgreSQL migration: OK"
-    )
+    return {"name": "👁️ NFT Глазик", "type": "NFT", "valuable": True}
 
 
-async def init_database():
+def luxury_prize():
+    return {
+        "name": random.choice([
+            "🎁 Wavegram Gift #1",
+            "🎁 Wavegram Gift #2",
+            "🎁 Wavegram Gift #3",
+            "💎 Wavegram Luxury Gift",
+            "👑 Wavegram Premium Gift",
+        ]),
+        "type": "Gift",
+        "valuable": True,
+    }
 
-    for attempt in range(15):
 
+# ============================================================
+# ADMIN NOTIFICATION
+# ============================================================
+
+def notify_admins_win(user_id, username, case_name, prize):
+    text = f"""
+<b>🚨 ЦЕННЫЙ ВЫИГРЫШ</b>
+
+👤 <code>{user_id}</code>
+{('@' + username) if username else 'без username'}
+
+🎁 {case_name}
+🏆 <b>{prize}</b>
+"""
+
+    for admin_id in ADMINS:
         try:
-
-            await migrate_database()
-
-            # ----------------------------------------------------
-            # Проверяем администраторов
-            # ----------------------------------------------------
-
-            async with SessionLocal() as db:
-
-                for admin_id in ADMIN_IDS:
-
-                    result = await db.execute(
-                        select(User).where(
-                            User.id == admin_id
-                        )
-                    )
-
-                    user = (
-                        result.scalar_one_or_none()
-                    )
-
-                    if user:
-
-                        user.is_admin = True
-
-                await db.commit()
-
-            logging.info(
-                "Администраторы проверены."
-            )
-
-            return True
-
-        except Exception as error:
-
-            logging.exception(
-                "Ошибка PostgreSQL: %s",
-                error,
-            )
-
-            if attempt == 14:
-
-                return False
-
-            await asyncio.sleep(3)
-
-    return False
-
-
-# ============================================================
-# USER
-# ============================================================
-
-async def get_or_create_user(
-    db: AsyncSession,
-    telegram_user,
-):
-
-    result = await db.execute(
-        select(User).where(
-            User.id == telegram_user.id
-        )
-    )
-
-    user = result.scalar_one_or_none()
-
-    if user is None:
-
-        user = User(
-            id=telegram_user.id,
-            username=telegram_user.username,
-            first_name=telegram_user.first_name,
-            balance=0,
-            is_admin=(
-                telegram_user.id
-                in ADMIN_IDS
-            ),
-        )
-
-        db.add(user)
-
-    else:
-
-        user.username = (
-            telegram_user.username
-        )
-
-        user.first_name = (
-            telegram_user.first_name
-        )
-
-        if telegram_user.id in ADMIN_IDS:
-
-            user.is_admin = True
-
-    await db.commit()
-
-    await db.refresh(user)
-
-    return user
-
-
-# ============================================================
-# MENUS
-# ============================================================
-
-def main_menu(is_admin=False):
-    rows = [
-        [InlineKeyboardButton(text="🎁 Кейсы", callback_data="cases"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="💰 Пополнение", callback_data="deposit"), InlineKeyboardButton(text="📦 Инвентарь", callback_data="inventory")],
-    ]
-    if is_admin:
-        rows.append([InlineKeyboardButton(text="🛡 Админ-панель", callback_data="admin")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def cases_menu():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"🎫 Билитер "
-                        f"— {BILETER_PRICE} ⭐"
-                    ),
-                    callback_data="case:bileter",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"💎 Лакшери "
-                        f"— {LUXURY_PRICE} ⭐"
-                    ),
-                    callback_data="case:luxury",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"💊 Наркоман "
-                        f"— {NARKOMAN_PRICE} ⭐"
-                    ),
-                    callback_data="case:narkoman",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"🎨 Цветной кейс — {COLOR_PRICE} ⭐",
-                    callback_data="case:color",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="home",
-                )
-            ],
-        ]
-    )
-
-
-def back_menu(
-    callback="home"
-):
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data=callback,
-                )
-            ]
-        ]
-    )
-
-
-# ============================================================
-# ADMIN MENU
-# ============================================================
-def admin_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"), InlineKeyboardButton(text="🧾 Команды", callback_data="admin:help")],
-        [InlineKeyboardButton(text="➕ Выдать ⭐", callback_data="admin:give"), InlineKeyboardButton(text="➖ Снять ⭐", callback_data="admin:take")],
-        [InlineKeyboardButton(text="📦 Инвентарь игрока", callback_data="admin:inventory")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
-    ])
-
-
-# ============================================================
-# ADMIN NOTIFICATIONS
-# ============================================================
-
-async def notify_admins(
-    message_text
-):
-
-    for admin_id in ADMIN_IDS:
-
-        try:
-
-            await bot.send_message(
-                chat_id=admin_id,
-                text=message_text,
-            )
-
-        except Exception as error:
-
-            logging.error(
-                "Ошибка отправки админу %s: %s",
-                admin_id,
-                error,
-            )
+            bot.send_message(admin_id, text)
+        except Exception:
+            pass
 
 
 # ============================================================
 # START
 # ============================================================
 
-@dp.message(CommandStart())
-async def start_command(
-    message: Message
-):
+@bot.message_handler(commands=["start"])
+def start(message):
+    u = message.from_user
+    ensure_user(u.id, u.username, u.first_name)
 
-    logging.info(
-        "Получен /start от %s",
-        message.from_user.id,
+    bot.send_message(
+        message.chat.id,
+        HOME_TEXT,
+        reply_markup=main_keyboard(u.id),
     )
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+@bot.callback_query_handler(func=lambda call: True)
+def callbacks(call):
+    user_id = call.from_user.id
+    u = call.from_user
+
+    ensure_user(user_id, u.username, u.first_name)
 
     try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
 
-        async with SessionLocal() as db:
+    data = call.data or ""
 
-            await get_or_create_user(
-                db,
-                message.from_user,
+    # HOME
+    if data == "home":
+        try:
+            bot.edit_message_text(
+                HOME_TEXT,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_keyboard(user_id),
             )
-
-        await message.answer(
-            "🎮 <b>Кейс-бот</b>\n\n"
-            "⭐ Здесь используются "
-            "внутренние игровые звёзды.\n\n"
-            "Они не являются настоящими "
-            "Telegram Stars.\n\n"
-            "Выбери действие:",
-            reply_markup=main_menu(callback.from_user.id in ADMIN_IDS),
-            parse_mode=ParseMode.HTML,
-        )
-
-    except Exception as error:
-
-        logging.exception(
-            "Ошибка /start: %s",
-            error,
-        )
-
-        await message.answer(
-            "⚠️ Произошла ошибка.\n\n"
-            "Попробуй ещё раз через несколько секунд."
-        )
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@dp.callback_query(
-    F.data == "home"
-)
-async def home(
-    callback: CallbackQuery
-):
-
-    await callback.message.edit_text(
-        "🎮 <b>Главное меню</b>",
-        reply_markup=main_menu(callback.from_user.id in ADMIN_IDS),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# PROFILE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "profile"
-)
-async def profile(
-    callback: CallbackQuery
-):
-
-    async with SessionLocal() as db:
-
-        user = await get_or_create_user(
-            db,
-            callback.from_user,
-        )
-
-    username = (
-        "@" + user.username
-        if user.username
-        else "не указан"
-    )
-
-    await callback.message.edit_text(
-        "👤 <b>Профиль</b>\n\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Username: {username}\n"
-        f"⭐ Баланс: <b>{user.balance}</b>",
-        reply_markup=main_menu(message.from_user.id in ADMIN_IDS),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# CASES
-# ============================================================
-
-@dp.callback_query(
-    F.data == "cases"
-)
-async def cases(
-    callback: CallbackQuery
-):
-
-    await callback.message.edit_text(
-        "🎁 <b>Кейсы</b>\n\n"
-        "Награда определяется случайно.\n"
-        "❗ Гарантированных наград нет.",
-        reply_markup=cases_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# DEPOSIT
-# ============================================================
-
-@dp.callback_query(
-    F.data == "deposit"
-)
-async def deposit(
-    callback: CallbackQuery
-):
-
-    await callback.message.edit_text(
-        "💰 <b>Пополнение</b>\n\n"
-        "Валюту для кейсов можно приобрести "
-        "за настоящие Telegram Stars у:\n\n"
-        "• @doxme\n"
-        "• @modeevil\n"
-        "• @bogkm\n\n"
-        "После покупки игровые ⭐ выдаются "
-        "администратором.\n\n"
-        "⚠️ ⭐ внутри бота — игровая валюта "
-        "и не являются настоящими Telegram Stars.",
-        reply_markup=back_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# INVENTORY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "inventory"
-)
-async def inventory(
-    callback: CallbackQuery
-):
-
-    async with SessionLocal() as db:
-
-        result = await db.execute(
-            select(InventoryItem)
-            .where(
-                InventoryItem.user_id
-                == callback.from_user.id
+        except Exception:
+            bot.send_message(
+                call.message.chat.id,
+                HOME_TEXT,
+                reply_markup=main_keyboard(user_id),
             )
-            .order_by(
-                InventoryItem.id.desc()
-            )
-            .limit(50)
-        )
-
-        items = result.scalars().all()
-
-    if not items:
-
-        await callback.message.edit_text(
-            "📦 <b>Инвентарь пуст.</b>",
-            reply_markup=back_menu(),
-        )
-
-        await callback.answer()
-
         return
 
-    lines = [
-        "📦 <b>Инвентарь</b>\n"
-    ]
+    # PROFILE
+    if data == "profile":
+        bot.edit_message_text(
+            profile_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_keyboard(),
+        )
+        return
 
-    for item in items:
+    # INVENTORY
+    if data == "inventory":
+        bot.edit_message_text(
+            inventory_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_keyboard(),
+        )
+        return
 
-        if item.status == "pending":
+    # TOPUP
+    if data == "topup":
+        bot.edit_message_text(
+            topup_text(),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_keyboard(),
+        )
+        return
 
-            status = "⏳ Ожидает выдачи"
+    # CASES
+    if data == "cases":
+        text = """
+<b>🎁 КЕЙСЫ</b>
 
-        elif item.status == "issued":
+━━━━━━━━━━━━━━━━━━━━
 
-            status = "✅ Выдано"
+🎫 Билетёр — 100 ⭐
+🍬 Ириски и риски — ставка
+💎 Лакшери — 2 000 ⭐
+🥤 Наркоман — 100 ⭐
+🔴🔵🟡 Цвет — 100 ⭐
 
-        else:
+Выбери кейс 👇
+"""
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=cases_keyboard(),
+        )
+        return
 
-            status = item.status
+    # OPEN
+    if data.startswith("open:"):
+        open_case(call, data.split(":", 1)[1])
+        return
 
-        lines.append(
-            f"#{item.id} — "
-            f"{item.item_name}\n"
-            f"Статус: {status}"
+    # COLORS
+    if data.startswith("color:"):
+        play_color(call, data.split(":", 1)[1])
+        return
+
+    # ADMIN
+    if data == "admin":
+        if user_id not in ADMINS:
+            bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
+            return
+
+        bot.edit_message_text(
+            """
+<b>👑 ADMIN CONTROL</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Управление ботом:
+
+⭐ Балансы
+👤 Пользователи
+🎁 Кейсы
+📊 Статистика
+📜 История
+📢 Рассылка
+""",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if data.startswith("admin:"):
+        if user_id not in ADMINS:
+            bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
+            return
+
+        admin_action(call, data.split(":", 1)[1])
+        return
+
+    if data.startswith("toggle:"):
+        if user_id not in ADMINS:
+            return
+
+        case_id = data.split(":", 1)[1]
+        case = case_info(case_id)
+        if not case:
+            return
+
+        set_case_enabled(case_id, not case["enabled"])
+
+        bot.edit_message_text(
+            "<b>🎁 УПРАВЛЕНИЕ КЕЙСАМИ</b>\n\nСтатус обновлён.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_cases_keyboard(),
         )
 
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=back_menu(),
-    )
-
-    await callback.answer()
-
 
 # ============================================================
-# ADD INVENTORY
+# ADMIN ACTIONS
 # ============================================================
 
-async def add_inventory(
-    db,
-    user_id,
-    item_name,
-    item_type,
-    source_case,
-):
+def admin_action(call, action):
+    user_id = call.from_user.id
 
-    db.add(
-        InventoryItem(
-            user_id=user_id,
-            item_name=item_name,
-            item_type=item_type,
-            source_case=source_case,
-            status="pending",
+    if action == "add":
+        set_state(user_id, "admin_add")
+        bot.send_message(
+            user_id,
+            "<b>⭐ ВЫДАТЬ ЗВЁЗДЫ</b>\n\n"
+            "Формат:\n<code>ID количество</code>\n\n"
+            "Пример:\n<code>123456789 500</code>",
         )
-    )
 
-
-# ============================================================
-# CHARGE BALANCE
-# ============================================================
-
-async def charge_balance(
-    db,
-    user_id,
-    amount,
-):
-
-    result = await db.execute(
-        select(User)
-        .where(
-            User.id == user_id
+    elif action == "remove":
+        set_state(user_id, "admin_remove")
+        bot.send_message(
+            user_id,
+            "<b>➖ СНЯТЬ ЗВЁЗДЫ</b>\n\n"
+            "Формат:\n<code>ID количество</code>",
         )
-        .with_for_update()
-    )
 
-    user = result.scalar_one()
+    elif action == "user":
+        set_state(user_id, "admin_user")
+        bot.send_message(
+            user_id,
+            "<b>👤 ПОЛЬЗОВАТЕЛЬ</b>\n\n"
+            "Отправь Telegram ID пользователя.",
+        )
 
-    if user.balance < amount:
+    elif action == "cases":
+        bot.edit_message_text(
+            "<b>🎁 УПРАВЛЕНИЕ КЕЙСАМИ</b>\n\n"
+            "Нажми на кейс, чтобы включить или выключить его:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_cases_keyboard(),
+        )
 
-        return None
+    elif action == "stats":
+        users, stars, openings, enabled = get_stats()
 
-    user.balance -= amount
+        bot.edit_message_text(
+            f"""
+<b>📊 СТАТИСТИКА</b>
 
-    return user
+━━━━━━━━━━━━━━━━━━━━
+
+👥 Пользователей: <b>{users}</b>
+⭐ Всего звёзд: <b>{stars}</b>
+🎁 Открытий: <b>{openings}</b>
+🟢 Активных кейсов: <b>{enabled}</b>
+👑 Админов: <b>{len(ADMINS)}</b>
+""",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_keyboard(),
+        )
+
+    elif action == "history":
+        bot.send_message(
+            user_id,
+            "<b>📜 ИСТОРИЯ</b>\n\n"
+            "История открытий хранится в таблице "
+            "<code>opening_history</code> PostgreSQL.\n"
+            "Для просмотра конкретного пользователя отправь его ID через «Пользователь».",
+        )
+
+    elif action == "broadcast":
+        set_state(user_id, "broadcast")
+        bot.send_message(
+            user_id,
+            "<b>📢 BROADCAST</b>\n\n"
+            "Отправь текст сообщения для рассылки.\n\n"
+            "⚠️ Рассылка выполняется всем пользователям из базы.",
+        )
 
 
 # ============================================================
 # OPEN CASE
 # ============================================================
 
-async def open_case(
-    callback,
-    case_name,
-    price,
-    rewards,
-):
+def open_case(call, case_id):
+    user_id = call.from_user.id
 
-    async with SessionLocal() as db:
-
-        user = await charge_balance(
-            db,
-            callback.from_user.id,
-            price,
+    if not is_enabled(case_id):
+        bot.answer_callback_query(
+            call.id,
+            "❌ Кейс сейчас выключен",
+            show_alert=True,
         )
+        return
 
-        if user is None:
+    case = case_info(case_id)
+    if not case:
+        bot.answer_callback_query(
+            call.id,
+            "❌ Кейс не найден",
+            show_alert=True,
+        )
+        return
 
-            await db.rollback()
+    # RISK
+    if case_id == "risk":
+        set_state(user_id, "risk_bet")
+        bot.send_message(
+            call.message.chat.id,
+            """
+<b>🍬 ИРИСКИ И РИСКИ</b>
 
-            await callback.answer(
+━━━━━━━━━━━━━━━━━━━━
+
+Введи ставку в ⭐.
+
+🎯 Победа: ставка × 2
+💥 Проигрыш: ставка сгорает
+
+Например:
+<code>100</code>
+""",
+            reply_markup=back_keyboard("cases"),
+        )
+        return
+
+    # COLORS
+    if case_id == "colors":
+        if get_balance(user_id) < 100:
+            bot.answer_callback_query(
+                call.id,
                 "❌ Недостаточно ⭐",
                 show_alert=True,
             )
+            return
 
-            return None
+        # ВАЖНО: деньги списываются только один раз здесь.
+        new_balance = change_balance(user_id, -100)
+        if new_balance is None:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Недостаточно ⭐",
+                show_alert=True,
+            )
+            return
 
-        reward = choose_reward(
-            rewards
+        set_state(user_id, "color_game")
+
+        bot.send_message(
+            call.message.chat.id,
+            """
+<b>🔴 🔵 🟡 ЦВЕТ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Стоимость: <b>100 ⭐</b>
+
+В одном из трёх цветов находится NFT.
+
+Выбирай 👇
+""",
+            reply_markup=color_keyboard(),
         )
+        return
 
-        reward_name = reward[0]
-        reward_type = reward[1]
-        reward_value = reward[3]
+    price = int(case["price"])
 
-        # ----------------------------------------------------
-        # Денежная игровая награда
-        # ----------------------------------------------------
+    # Atomic lock against double clicks.
+    lock = get_user_lock(user_id)
+    if not lock.acquire(blocking=False):
+        bot.answer_callback_query(
+            call.id,
+            "⏳ Подожди, кейс уже открывается",
+            show_alert=True,
+        )
+        return
 
-        if reward_type == "balance":
+    try:
+        if get_balance(user_id) < price:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Недостаточно ⭐",
+                show_alert=True,
+            )
+            return
 
-            user.balance += reward_value
+        if change_balance(user_id, -price) is None:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Не удалось списать ⭐",
+                show_alert=True,
+            )
+            return
 
-        # ----------------------------------------------------
-        # NFT / Gift / редкий предмет
-        # ----------------------------------------------------
-
-        elif reward_type in {
-            "nft",
-            "gift",
-        }:
-
-            await add_inventory(
-                db,
-                user.id,
-                reward_name,
-                reward_type,
-                case_name,
+        # Short animation.
+        try:
+            msg = bot.send_message(
+                call.message.chat.id,
+                "🎁 <b>Открываем кейс...</b>",
             )
 
-        # ----------------------------------------------------
-        # История открытия
-        # ----------------------------------------------------
+            for emoji in ["🎁", "✨", "🎁", "💫", "🎁"]:
+                time.sleep(0.18)
+                try:
+                    bot.edit_message_text(
+                        f"<b>{emoji}</b>\n\nОткрываем...",
+                        msg.chat.id,
+                        msg.message_id,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        db.add(
-            CaseOpen(
-                user_id=user.id,
-                case_name=case_name,
-                price=price,
-                reward_name=reward_name,
-                reward_type=reward_type,
-                reward_value=reward_value,
-            )
-        )
-
-        await db.commit()
-
-        return (
-            reward_name,
-            reward_type,
-            reward_value,
-            user.balance,
-        )
-
-
-# ============================================================
-# BILETER
-# ============================================================
-
-@dp.callback_query(
-    F.data == "case:bileter"
-)
-async def bileter(
-    callback: CallbackQuery
-):
-
-    result = await open_case(
-        callback,
-        "Билитер",
-        BILETER_PRICE,
-        BILETER_REWARDS,
-    )
-
-    if result is None:
-        return
-
-    (
-        reward_name,
-        reward_type,
-        reward_value,
-        balance,
-    ) = result
-
-    if reward_type == "balance":
-
-        text_result = (
-            "🎫 <b>Билитер открыт!</b>\n\n"
-            f"🎁 {reward_name}\n"
-            f"⭐ +{reward_value}\n\n"
-            f"Баланс: <b>{balance} ⭐</b>"
-        )
-
-    else:
-
-        text_result = (
-            "🎫 <b>Билитер открыт!</b>\n\n"
-            f"✨ <b>{reward_name}</b>\n\n"
-            "Предмет добавлен в инвентарь."
-        )
-
-        await notify_admins(
-            "🚨 <b>Редкая награда!</b>\n\n"
-            f"ID: <code>"
-            f"{callback.from_user.id}"
-            f"</code>\n"
-            f"Username: "
-            f"@{callback.from_user.username or 'нет'}\n"
-            "Кейс: Билитер\n"
-            f"Награда: <b>{reward_name}</b>"
-        )
-
-    await callback.message.edit_text(
-        text_result,
-        reply_markup=cases_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# LUXURY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "case:luxury"
-)
-async def luxury(
-    callback: CallbackQuery
-):
-
-    result = await open_case(
-        callback,
-        "Лакшери",
-        LUXURY_PRICE,
-        LUXURY_REWARDS,
-    )
-
-    if result is None:
-        return
-
-    (
-        reward_name,
-        reward_type,
-        reward_value,
-        balance,
-    ) = result
-
-    await callback.message.edit_text(
-        "💎 <b>Лакшери открыт!</b>\n\n"
-        f"🎁 <b>{reward_name}</b>\n\n"
-        "Предмет добавлен в инвентарь.",
-        reply_markup=cases_menu(),
-    )
-
-    await notify_admins(
-        "💎 <b>Выпала награда из Лакшери</b>\n\n"
-        f"ID: <code>"
-        f"{callback.from_user.id}"
-        f"</code>\n"
-        f"Username: "
-        f"@{callback.from_user.username or 'нет'}\n"
-        f"Награда: <b>{reward_name}</b>"
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# NARKOMAN
-# ============================================================
-
-@dp.callback_query(
-    F.data == "case:narkoman"
-)
-async def narkoman(
-    callback: CallbackQuery
-):
-
-    result = await open_case(
-        callback,
-        "Наркоман",
-        NARKOMAN_PRICE,
-        NARKOMAN_REWARDS,
-    )
-
-    if result is None:
-        return
-
-    (
-        reward_name,
-        reward_type,
-        reward_value,
-        balance,
-    ) = result
-
-    if reward_type == "balance":
-
-        text_result = (
-            "💊 <b>Наркоман открыт!</b>\n\n"
-            f"🎁 {reward_name}\n\n"
-            f"Баланс: <b>{balance} ⭐</b>"
-        )
-
-    else:
-
-        text_result = (
-            "💊 <b>Наркоман открыт!</b>\n\n"
-            f"✨ <b>{reward_name}</b>\n\n"
-            "Предмет добавлен в инвентарь."
-        )
-
-        await notify_admins(
-            "🚨 <b>Выпал NFT!</b>\n\n"
-            f"ID: <code>"
-            f"{callback.from_user.id}"
-            f"</code>\n"
-            f"Username: "
-            f"@{callback.from_user.username or 'нет'}\n"
-            "Кейс: Наркоман\n"
-            f"Награда: <b>{reward_name}</b>"
-        )
-
-    await callback.message.edit_text(
-        text_result,
-        reply_markup=cases_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# COLOR CASE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "case:color"
-)
-async def color_case(
-    callback: CallbackQuery
-):
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔴 Красный",
-                    callback_data="color:red",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔵 Синий",
-                    callback_data="color:blue",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟡 Жёлтый",
-                    callback_data="color:yellow",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="cases",
-                ),
-            ],
-        ]
-    )
-
-    await callback.message.edit_text(
-        "🔴🔵🟡 <b>Красный / "
-        "Синий / Жёлтый</b>\n\n"
-        "В одном из цветов находится NFT.\n\n"
-        "Выбери цвет:",
-        reply_markup=keyboard,
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# COLOR RESULT
-# ============================================================
-
-@dp.callback_query(F.data.startswith("color:"))
-async def color_result(callback: CallbackQuery):
-    selected = callback.data.split(":", 1)[1]
-    colors = {"red":"🔴 Красный", "blue":"🔵 Синий", "yellow":"🟡 Жёлтый"}
-    async with SessionLocal() as db:
-        user = await charge_balance(db, callback.from_user.id, COLOR_PRICE)
-        if user is None:
-            await db.rollback(); await callback.answer("❌ Недостаточно ⭐", show_alert=True); return
-        winning = random.choice(list(colors))
-        if selected == winning:
-            reward_name, reward_type = "NFT", "nft"
-            await add_inventory(db, user.id, reward_name, reward_type, "Цветной кейс")
-            text_result = f"🎉 <b>ПОБЕДА!</b>\n\nТвой цвет: {colors[selected]}\nВыигрышный: {colors[winning]}\n\n✨ NFT добавлен в инвентарь.\n💰 Баланс: <b>{user.balance} ⭐</b>"
+        if case_id == "bileter":
+            prize = bileter_prize()
+        elif case_id == "narkoman":
+            prize = narkoman_prize()
+        elif case_id == "luxury":
+            prize = luxury_prize()
         else:
-            reward_name, reward_type = "Проигрыш", "lose"
-            text_result = f"😔 <b>Проигрыш</b>\n\nТвой цвет: {colors[selected]}\nВыигрышный цвет: {colors[winning]}\n\n💰 Баланс: <b>{user.balance} ⭐</b>"
-        db.add(CaseOpen(user_id=user.id, case_name="Цветной кейс", price=COLOR_PRICE, selected_color=selected, winning_color=winning, reward_name=reward_name, reward_type=reward_type, reward_value=0))
-        await db.commit()
-    if selected == winning:
-        await notify_admins(f"🚨 <b>Выпал NFT!</b>\n\nID: <code>{callback.from_user.id}</code>\nUsername: @{callback.from_user.username or 'нет'}\nКейс: Цветной — {colors[winning]}")
-    await callback.message.edit_text(text_result, reply_markup=cases_menu())
-    await callback.answer()
+            prize = {
+                "name": "🎁 Приз",
+                "type": "Gift",
+                "valuable": True,
+            }
 
-
-# ============================================================
-# ADMIN CALLBACKS
-# ============================================================
-@dp.callback_query(F.data == "admin")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    await callback.message.edit_text("🛡 <b>Панель администратора</b>\n\nВыберите действие:", reply_markup=admin_menu()); await callback.answer()
-
-@dp.callback_query(F.data == "admin:stats")
-async def admin_stats_button(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    async with SessionLocal() as db:
-        u=await db.scalar(select(func.count(User.id))) or 0; c=await db.scalar(select(func.count(CaseOpen.id))) or 0; i=await db.scalar(select(func.count(InventoryItem.id))) or 0; b=await db.scalar(select(func.coalesce(func.sum(User.balance),0))) or 0
-    await callback.message.edit_text(f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{u}</b>\n🎁 Открытий: <b>{c}</b>\n📦 Предметов: <b>{i}</b>\n⭐ Общий баланс: <b>{b}</b>", reply_markup=admin_menu()); await callback.answer()
-
-@dp.callback_query(F.data == "admin:give")
-async def admin_give_button(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    await callback.message.edit_text("➕ <b>Выдача ⭐</b>\n\nИспользуйте команду:\n<code>/give ID СУММА</code>", reply_markup=admin_menu()); await callback.answer()
-
-@dp.callback_query(F.data == "admin:take")
-async def admin_take_button(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    await callback.message.edit_text("➖ <b>Снятие ⭐</b>\n\nИспользуйте команду:\n<code>/take ID СУММА</code>", reply_markup=admin_menu()); await callback.answer()
-
-@dp.callback_query(F.data == "admin:inventory")
-async def admin_inventory_button(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    await callback.message.edit_text("📦 <b>Инвентарь игрока</b>\n\nИспользуйте команду:\n<code>/inventory ID</code>", reply_markup=admin_menu()); await callback.answer()
-
-@dp.callback_query(F.data == "admin:help")
-async def admin_help_button(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
-    await callback.message.edit_text("🛠 <b>Команды</b>\n\n/stats — статистика\n/give ID СУММА — выдать ⭐\n/take ID СУММА — снять ⭐\n/inventory ID — инвентарь\n/issue ITEM_ID — выдать предмет", reply_markup=admin_menu()); await callback.answer()
-
-# ============================================================
-# ADMIN CHECK
-# ============================================================
-
-def is_admin(user_id):
-
-    return user_id in ADMIN_IDS
-
-
-# ============================================================
-# /STATS
-# ============================================================
-
-@dp.message(
-    Command("stats")
-)
-async def stats(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    async with SessionLocal() as db:
-
-        users_count = await db.scalar(
-            select(
-                func.count(User.id)
-            )
-        )
-
-        cases_count = await db.scalar(
-            select(
-                func.count(CaseOpen.id)
-            )
-        )
-
-        items_count = await db.scalar(
-            select(
-                func.count(InventoryItem.id)
-            )
-        )
-
-        total_balance = await db.scalar(
-            select(
-                func.coalesce(
-                    func.sum(User.balance),
-                    0,
-                )
-            )
-        )
-
-    await message.answer(
-        "📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: "
-        f"<b>{users_count}</b>\n"
-        f"🎁 Открытий: "
-        f"<b>{cases_count}</b>\n"
-        f"📦 Предметов: "
-        f"<b>{items_count}</b>\n"
-        f"⭐ Общий баланс: "
-        f"<b>{total_balance}</b>"
-    )
-
-
-# ============================================================
-# /GIVE
-# ============================================================
-
-@dp.message(
-    Command("give")
-)
-async def give(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 3:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/give ID СУММА</code>"
-        )
-
-        return
-
-    try:
-
-        user_id = int(parts[1])
-        amount = int(parts[2])
-
-        if amount <= 0:
-            raise ValueError
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверные данные."
-        )
-
-        return
-
-    async with SessionLocal() as db:
-
-        result = await db.execute(
-            select(User)
-            .where(
-                User.id == user_id
-            )
-            .with_for_update()
-        )
-
-        user = result.scalar_one_or_none()
-
-        if user is None:
-
-            await message.answer(
-                "❌ Пользователь не найден."
+        if prize.get("type") == "stars":
+            amount = int(prize["stars"])
+            change_balance(user_id, amount)
+        else:
+            add_inventory(
+                user_id,
+                {
+                    "name": prize["name"],
+                    "type": prize["type"],
+                    "time": int(time.time()),
+                },
             )
 
-            return
+        save_history(user_id, case, prize, price)
 
-        user.balance += amount
+        text = f"""
+<b>🎉 ВЫИГРЫШ!</b>
 
-        db.add(
-            BalanceLog(
-                user_id=user.id,
-                admin_id=message.from_user.id,
-                amount=amount,
-                balance_after=user.balance,
-                operation="give",
+━━━━━━━━━━━━━━━━━━━━
+
+🎁 Кейс: <b>{case['name']}</b>
+
+🏆 Приз:
+<b>{prize['name']}</b>
+"""
+
+        if prize.get("type") == "stars":
+            text += f"\n⭐ Зачислено: <b>{prize['stars']}</b>"
+
+        text += f"\n\n💰 Баланс: <b>{get_balance(user_id)}</b> ⭐"
+
+        bot.send_message(
+            call.message.chat.id,
+            text,
+            reply_markup=main_keyboard(user_id),
+        )
+
+        if prize.get("valuable"):
+            notify_admins_win(
+                user_id,
+                call.from_user.username,
+                case["name"],
+                prize["name"],
             )
-        )
-
-        await db.commit()
-
-    await message.answer(
-        "✅ <b>Звёзды выданы</b>\n\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Выдано: <b>+{amount} ⭐</b>\n"
-        f"Баланс: <b>{user.balance} ⭐</b>"
-    )
-
-
-# ============================================================
-# /TAKE
-# ============================================================
-
-@dp.message(
-    Command("take")
-)
-async def take(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 3:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/take ID СУММА</code>"
-        )
-
-        return
-
-    try:
-
-        user_id = int(parts[1])
-        amount = int(parts[2])
-
-        if amount <= 0:
-            raise ValueError
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверные данные."
-        )
-
-        return
-
-    async with SessionLocal() as db:
-
-        result = await db.execute(
-            select(User)
-            .where(
-                User.id == user_id
-            )
-            .with_for_update()
-        )
-
-        user = result.scalar_one_or_none()
-
-        if user is None:
-
-            await message.answer(
-                "❌ Пользователь не найден."
-            )
-
-            return
-
-        if user.balance < amount:
-
-            await message.answer(
-                f"❌ У игрока только "
-                f"<b>{user.balance} ⭐</b>."
-            )
-
-            return
-
-        user.balance -= amount
-
-        db.add(
-            BalanceLog(
-                user_id=user.id,
-                admin_id=message.from_user.id,
-                amount=-amount,
-                balance_after=user.balance,
-                operation="take",
-            )
-        )
-
-        await db.commit()
-
-    await message.answer(
-        "✅ <b>Звёзды сняты</b>\n\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Снято: <b>-{amount} ⭐</b>\n"
-        f"Баланс: <b>{user.balance} ⭐</b>"
-    )
-
-
-# ============================================================
-# /INVENTORY
-# ============================================================
-
-@dp.message(
-    Command("inventory")
-)
-async def admin_inventory(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/inventory ID</code>"
-        )
-
-        return
-
-    try:
-
-        user_id = int(parts[1])
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверный ID."
-        )
-
-        return
-
-    async with SessionLocal() as db:
-
-        result = await db.execute(
-            select(InventoryItem)
-            .where(
-                InventoryItem.user_id == user_id
-            )
-            .order_by(
-                InventoryItem.id.desc()
-            )
-            .limit(50)
-        )
-
-        items = result.scalars().all()
-
-    if not items:
-
-        await message.answer(
-            "📦 Инвентарь пуст."
-        )
-
-        return
-
-    lines = [
-        "📦 <b>Инвентарь игрока</b>\n"
-    ]
-
-    for item in items:
-
-        lines.append(
-            f"#{item.id} — "
-            f"{item.item_name}\n"
-            f"Тип: {item.item_type}\n"
-            f"Статус: {item.status}\n"
-        )
-
-    await message.answer(
-        "\n".join(lines)
-    )
-
-
-# ============================================================
-# /ISSUE
-# ============================================================
-
-@dp.message(
-    Command("issue")
-)
-async def issue(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    parts = message.text.split(
-        maxsplit=2
-    )
-
-    if len(parts) < 2:
-
-        await message.answer(
-            "Использование:\n"
-            "<code>/issue ITEM_ID"
-            "</code>"
-        )
-
-        return
-
-    try:
-
-        item_id = int(parts[1])
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверный ID предмета."
-        )
-
-        return
-
-    note = (
-        parts[2]
-        if len(parts) == 3
-        else None
-    )
-
-    async with SessionLocal() as db:
-
-        result = await db.execute(
-            select(InventoryItem)
-            .where(
-                InventoryItem.id == item_id
-            )
-            .with_for_update()
-        )
-
-        item = result.scalar_one_or_none()
-
-        if item is None:
-
-            await message.answer(
-                "❌ Предмет не найден."
-            )
-
-            return
-
-        item.status = "issued"
-        item.admin_note = note
-
-        await db.commit()
-
-    await message.answer(
-        f"✅ Предмет #{item_id} "
-        "отмечен как выданный."
-    )
-
-
-# ============================================================
-# /ADMIN
-# ============================================================
-
-@dp.message(
-    Command("admin")
-)
-async def admin_help(
-    message: Message
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ Нет доступа."
-        )
-
-        return
-
-    await message.answer("🛡 <b>Панель администратора</b>\n\nВыберите действие:", reply_markup=admin_menu())
-
-
-# ============================================================
-# ОБРАБОТЧИК ОШИБОК
-# ============================================================
-
-@dp.errors()
-async def error_handler(
-    event
-):
-
-    logging.exception(
-        "Ошибка обработки update: %s",
-        event,
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main():
-
-    logging.info(
-        "===================================="
-    )
-
-    logging.info(
-        "Запуск бота..."
-    )
-
-    logging.info(
-        "API_HOST: %s",
-        API_HOST,
-    )
-
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
-
-    database_ok = await init_database()
-
-    if not database_ok:
-
-        raise RuntimeError(
-            "Не удалось подключиться "
-            "к PostgreSQL"
-        )
-
-    # --------------------------------------------------------
-    # TELEGRAM API
-    # --------------------------------------------------------
-
-    try:
-
-        me = await bot.get_me()
-
-        logging.info(
-            "Telegram API: OK"
-        )
-
-        logging.info(
-            "Бот: @%s",
-            me.username,
-        )
-
-        logging.info(
-            "Bot ID: %s",
-            me.id,
-        )
-
-    except Exception as error:
-
-        logging.exception(
-            "Telegram API error: %s",
-            error,
-        )
-
-        raise
-
-    # --------------------------------------------------------
-    # POLLING
-    # --------------------------------------------------------
-
-    try:
-
-        logging.info(
-            "Polling запущен."
-        )
-
-        await dp.start_polling(
-            bot,
-            allowed_updates=[
-                "message",
-                "callback_query",
-            ],
-        )
-
     finally:
-
-        await bot.session.close()
-
-        await engine.dispose()
+        lock.release()
 
 
 # ============================================================
-# START
+# COLOR GAME
 # ============================================================
+
+def play_color(call, selected):
+    user_id = call.from_user.id
+
+    with state_lock:
+        state = states.get(user_id)
+
+    if not state or state.get("state") != "color_game":
+        bot.answer_callback_query(
+            call.id,
+            "❌ Эта игра уже завершена",
+            show_alert=True,
+        )
+        return
+
+    if selected not in {"red", "blue", "yellow"}:
+        return
+
+    with state_lock:
+        states.pop(user_id, None)
+
+    names = {
+        "red": "🔴 Красный",
+        "blue": "🔵 Синий",
+        "yellow": "🟡 Жёлтый",
+    }
+
+    winning_color = random.choice(list(names.keys()))
+
+    if selected == winning_color:
+        prize = {
+            "name": "🎁 NFT",
+            "type": "NFT",
+            "valuable": True,
+        }
+
+        add_inventory(
+            user_id,
+            {
+                "name": prize["name"],
+                "type": "NFT",
+                "time": int(time.time()),
+            },
+        )
+
+        case = case_info("colors")
+        if case:
+            save_history(user_id, case, prize, 100)
+
+        bot.send_message(
+            call.message.chat.id,
+            f"""
+<b>🎉 ПОБЕДА!</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+Правильный цвет:
+<b>{names[winning_color]}</b>
+
+🎁 Ты получил:
+<b>NFT</b>
+""",
+            reply_markup=main_keyboard(user_id),
+        )
+
+        notify_admins_win(
+            user_id,
+            call.from_user.username,
+            "🔴🔵🟡 Цвет",
+            "🎁 NFT",
+        )
+    else:
+        bot.send_message(
+            call.message.chat.id,
+            f"""
+<b>💥 ПРОИГРЫШ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+NFT находился в:
+<b>{names[winning_color]}</b>
+
+Ты выбрал:
+<b>{names[selected]}</b>
+
+🍀 Повезёт в следующий раз.
+""",
+            reply_markup=main_keyboard(user_id),
+        )
+
+
+# ============================================================
+# STATE HELPERS
+# ============================================================
+
+def set_state(user_id, state, **extra):
+    with state_lock:
+        states[user_id] = {"state": state, **extra}
+
+
+def pop_state(user_id):
+    with state_lock:
+        return states.pop(user_id, None)
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+
+@bot.message_handler(content_types=["text"])
+def text_handler(message):
+    user_id = message.from_user.id
+    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
+
+    with state_lock:
+        state = dict(states.get(user_id, {}))
+
+    current_state = state.get("state")
+    if not current_state:
+        return
+
+    text = message.text.strip()
+
+    # RISK
+    if current_state == "risk_bet":
+        try:
+            bet = int(text)
+        except ValueError:
+            bot.send_message(
+                message.chat.id,
+                "❌ Введи целое число, например <code>100</code>.",
+            )
+            return
+
+        if bet <= 0:
+            bot.send_message(message.chat.id, "❌ Ставка должна быть больше 0.")
+            return
+
+        if bet > get_balance(user_id):
+            bot.send_message(message.chat.id, "❌ Недостаточно ⭐.")
+            return
+
+        if change_balance(user_id, -bet) is None:
+            bot.send_message(message.chat.id, "❌ Не удалось списать ставку.")
+            return
+
+        win = random.random() < 0.5
+
+        if win:
+            reward = bet * 2
+            change_balance(user_id, reward)
+
+            result = f"""
+<b>🍬 ИРИСКА — ПОБЕДА!</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 Ставка: <b>{bet}</b> ⭐
+🎉 Выплата: <b>{reward}</b> ⭐
+
+💰 Баланс: <b>{get_balance(user_id)}</b> ⭐
+"""
+        else:
+            result = f"""
+<b>💥 ИРИСКА — ПРОИГРЫШ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 Ставка: <b>{bet}</b> ⭐
+❌ Потеряно: <b>{bet}</b> ⭐
+
+💰 Баланс: <b>{get_balance(user_id)}</b> ⭐
+"""
+
+        pop_state(user_id)
+
+        bot.send_message(
+            message.chat.id,
+            result,
+            reply_markup=main_keyboard(user_id),
+        )
+        return
+
+    # ADMIN ADD
+    if current_state == "admin_add":
+        if user_id not in ADMINS:
+            pop_state(user_id)
+            return
+
+        parts = text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "Формат: <code>ID количество</code>")
+            return
+
+        try:
+            target_id = int(parts[0])
+            amount = int(parts[1])
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ ID и количество должны быть числами.")
+            return
+
+        if amount <= 0:
+            bot.send_message(message.chat.id, "❌ Количество должно быть больше 0.")
+            return
+
+        ensure_user(target_id)
+        new_balance = change_balance(target_id, amount, allow_negative=True)
+
+        pop_state(user_id)
+
+        bot.send_message(
+            message.chat.id,
+            f"""
+<b>✅ ЗВЁЗДЫ ВЫДАНЫ</b>
+
+👤 ID: <code>{target_id}</code>
+➕ <b>{amount}</b> ⭐
+💰 Новый баланс: <b>{new_balance}</b> ⭐
+""",
+            reply_markup=admin_keyboard(),
+        )
+
+        try:
+            bot.send_message(
+                target_id,
+                f"⭐ Вам начислено <b>+{amount}</b> ⭐\n"
+                f"Баланс: <b>{new_balance}</b> ⭐",
+            )
+        except Exception:
+            pass
+        return
+
+    # ADMIN REMOVE
+    if current_state == "admin_remove":
+        if user_id not in ADMINS:
+            pop_state(user_id)
+            return
+
+        parts = text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "Формат: <code>ID количество</code>")
+            return
+
+        try:
+            target_id = int(parts[0])
+            amount = int(parts[1])
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ ID и количество должны быть числами.")
+            return
+
+        if amount <= 0:
+            bot.send_message(message.chat.id, "❌ Количество должно быть больше 0.")
+            return
+
+        if not get_user(target_id):
+            bot.send_message(message.chat.id, "❌ Пользователь не найден.")
+            return
+
+        new_balance = change_balance(target_id, -amount)
+
+        if new_balance is None:
+            bot.send_message(message.chat.id, "❌ Недостаточно ⭐ у пользователя.")
+            return
+
+        pop_state(user_id)
+
+        bot.send_message(
+            message.chat.id,
+            f"""
+<b>✅ ЗВЁЗДЫ СНЯТЫ</b>
+
+👤 ID: <code>{target_id}</code>
+➖ <b>{amount}</b> ⭐
+💰 Новый баланс: <b>{new_balance}</b> ⭐
+""",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    # ADMIN USER
+    if current_state == "admin_user":
+        if user_id not in ADMINS:
+            pop_state(user_id)
+            return
+
+        try:
+            target_id = int(text)
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ Отправь корректный Telegram ID.")
+            return
+
+        target = get_user(target_id)
+        if not target:
+            bot.send_message(message.chat.id, "❌ Пользователь не найден.")
+            return
+
+        inventory = get_inventory(target_id)
+
+        pop_state(user_id)
+
+        bot.send_message(
+            message.chat.id,
+            f"""
+<b>👤 ПОЛЬЗОВАТЕЛЬ</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🆔 ID: <code>{target_id}</code>
+👤 Username: @{target['username'] if target['username'] else 'нет'}
+
+⭐ Баланс: <b>{target['stars']}</b>
+🎒 Предметов: <b>{len(inventory)}</b>
+""",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    # BROADCAST
+    if current_state == "broadcast":
+        if user_id not in ADMINS:
+            pop_state(user_id)
+            return
+
+        users = get_all_users()
+        success = 0
+        failed = 0
+
+        for target_id in users:
+            try:
+                bot.send_message(target_id, text)
+                success += 1
+            except Exception:
+                failed += 1
+            time.sleep(0.03)
+
+        pop_state(user_id)
+
+        bot.send_message(
+            message.chat.id,
+            f"""
+<b>📢 РАССЫЛКА ЗАВЕРШЕНА</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+✅ Успешно: <b>{success}</b>
+❌ Ошибок: <b>{failed}</b>
+""",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+
+# ============================================================
+# ERRORS / POLLING
+# ============================================================
+
+def safe_polling():
+    while True:
+        try:
+            print("=" * 50)
+            print("CASE BOT STARTING")
+            print("DATABASE:", "configured")
+            print("ADMINS:", ADMINS)
+            print("=" * 50)
+
+            init_db()
+
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=30,
+                long_polling_timeout=30,
+            )
+
+        except Exception as e:
+            print("BOT ERROR:", repr(e))
+            print("Restarting in 5 seconds...")
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        logging.info(
-            "Бот остановлен."
-        )
-
-    except Exception as error:
-
-        logging.exception(
-            "Критическая ошибка: %s",
-            error,
-        )
-
-        raise
+    safe_polling()
