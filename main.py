@@ -1,14 +1,13 @@
 import os
-import json
 import random
-import time
-import threading
-from typing import Optional
+import logging
+from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import telebot
 from telebot import types
+import telebot.apihelper
 
 
 # ============================================================
@@ -18,1396 +17,2461 @@ from telebot import types
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-ADMINS = {
+# API приватного Wavegram
+API_URL = os.getenv(
+    "API_URL",
+    "http://31.76.20.193:8081/bot{0}/{1}"
+).strip()
+
+# ============================================================
+# АДМИНИ
+# ============================================================
+
+ADMIN_IDS = {
     1780243378,
     1780243308,
     1780243345,
 }
 
-TOP_UP_CONTACTS = ["@doxme", "@modeevil", "@bogkm"]
+ADMIN_USERNAMES = {
+    "doxme",
+    "bogkm",
+    "modeevil",
+}
+
+
+# ============================================================
+# НАСТРОЙКИ КЕЙСОВ
+# ============================================================
+
+# Билитер
+BILITER_PRICE = int(os.getenv("BILITER_PRICE", "100"))
+BILITER_NORMAL_REWARD = int(
+    os.getenv("BILITER_NORMAL_REWARD", "50")
+)
+
+# 0.01 = 1%
+BILITER_GOLD_CHANCE = float(
+    os.getenv("BILITER_GOLD_CHANCE", "0.01")
+)
+
+# Ириски риски
+IRISKI_MIN_BET = int(
+    os.getenv("IRISKI_MIN_BET", "1")
+)
+
+IRISKI_MAX_BET = int(
+    os.getenv("IRISKI_MAX_BET", "1000000")
+)
+
+# 0.50 = 50%
+IRISKI_WIN_CHANCE = float(
+    os.getenv("IRISKI_WIN_CHANCE", "0.50")
+)
+
+IRISKI_MULTIPLIER = int(
+    os.getenv("IRISKI_MULTIPLIER", "2")
+)
+
+# Лакшери
+LUXURY_PRICE = int(
+    os.getenv("LUXURY_PRICE", "2000")
+)
+
+# Пока список можно заменить на реальные GIFTS
+# после получения API их ID.
+LUXURY_GIFTS = [
+    "Luxury Gift #1",
+    "Luxury Gift #2",
+    "Luxury Gift #3",
+    "Luxury Gift #4",
+    "Luxury Gift #5",
+]
+
+# Наркоман
+NARKOMAN_PRICE = int(
+    os.getenv("NARKOMAN_PRICE", "100")
+)
+
+NARKOMAN_REWARD = int(
+    os.getenv("NARKOMAN_REWARD", "50")
+)
+
+# 0.01 = 1%
+NARKOMAN_NFT_CHANCE = float(
+    os.getenv("NARKOMAN_NFT_CHANCE", "0.01")
+)
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# ============================================================
+# ПРОВЕРКА CONFIG
+# ============================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError(
+        "BOT_TOKEN не задан в Railway Variables"
+    )
+
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+    raise RuntimeError(
+        "DATABASE_URL не задан в Railway Variables"
+    )
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 
-# user_id -> state dict
-states = {}
-state_lock = threading.RLock()
+# ============================================================
+# TELEGRAM API
+# ============================================================
 
-# Prevent double-click / concurrent case opening.
-user_locks = {}
-user_locks_lock = threading.Lock()
+telebot.apihelper.API_URL = API_URL
+
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    parse_mode="HTML"
+)
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id BIGINT PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+
+    balance BIGINT NOT NULL DEFAULT 0,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS nft_inventory (
+    id BIGSERIAL PRIMARY KEY,
+
+    user_id BIGINT NOT NULL
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    nft_name TEXT NOT NULL,
+
+    source_case TEXT NOT NULL,
+
+    status TEXT NOT NULL DEFAULT 'pending',
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    delivered_at TIMESTAMPTZ
+);
+
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id BIGSERIAL PRIMARY KEY,
+
+    user_id BIGINT NOT NULL
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    amount BIGINT NOT NULL,
+
+    balance_after BIGINT NOT NULL,
+
+    kind TEXT NOT NULL,
+
+    description TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS case_opens (
+    id BIGSERIAL PRIMARY KEY,
+
+    user_id BIGINT NOT NULL
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    case_name TEXT NOT NULL,
+
+    price BIGINT NOT NULL,
+
+    result TEXT NOT NULL,
+
+    reward_stars BIGINT NOT NULL DEFAULT 0,
+
+    nft_inventory_id BIGINT
+        REFERENCES nft_inventory(id)
+        ON DELETE SET NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS pending_iriski (
+    user_id BIGINT PRIMARY KEY,
+
+    bet BIGINT NOT NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE INDEX IF NOT EXISTS idx_nft_user_status
+ON nft_inventory(user_id, status);
+
+
+CREATE INDEX IF NOT EXISTS idx_nft_pending
+ON nft_inventory(status, created_at DESC);
+
+
+CREATE INDEX IF NOT EXISTS idx_case_user
+ON case_opens(user_id, created_at DESC);
+"""
+
+
+@contextmanager
 def db():
-    return psycopg2.connect(
-        DATABASE_URL,
-        sslmode="require",
-        connect_timeout=10,
-    )
+    conn = psycopg2.connect(DATABASE_URL)
+
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = db()
-    try:
-        cur = conn.cursor()
+    with db() as conn:
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT DEFAULT '',
-                first_name TEXT DEFAULT '',
-                stars BIGINT NOT NULL DEFAULT 0,
-                inventory TEXT NOT NULL DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cases (
-                case_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                price BIGINT NOT NULL DEFAULT 0,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS opening_history (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                case_id TEXT NOT NULL,
-                case_name TEXT NOT NULL,
-                prize_name TEXT NOT NULL,
-                prize_type TEXT NOT NULL,
-                price BIGINT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        default_cases = [
-            ("bileter", "🎫 Билетёр", 100, True),
-            ("risk", "🍬 Ириски и риски", 0, True),
-            ("luxury", "💎 Лакшери", 2000, True),
-            ("narkoman", "🥤 Наркоман", 100, True),
-            ("colors", "🔴🔵🟡 Цвет", 100, True),
-        ]
-
-        for item in default_cases:
-            cur.execute("""
-                INSERT INTO cases(case_id, name, price, enabled)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT(case_id) DO NOTHING
-            """, item)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA)
 
         conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+
+    logging.info("Database initialized")
 
 
-def ensure_user(user_id: int, username="", first_name=""):
-    conn = db()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+# ============================================================
+# USERS
+# ============================================================
 
-        cur.execute("""
-            INSERT INTO users(user_id, username, first_name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT(user_id)
-            DO UPDATE SET username=EXCLUDED.username,
-                          first_name=EXCLUDED.first_name
-            RETURNING *
-        """, (user_id, username or "", first_name or ""))
+def ensure_user(user):
 
-        user = cur.fetchone()
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO users(
+                    id,
+                    username,
+                    first_name
+                )
+                VALUES (%s, %s, %s)
+
+                ON CONFLICT(id)
+                DO UPDATE SET
+                    username=EXCLUDED.username,
+                    first_name=EXCLUDED.first_name,
+                    updated_at=NOW()
+                """,
+                (
+                    user.id,
+                    user.username,
+                    user.first_name
+                )
+            )
+
         conn.commit()
-        cur.close()
-        return user
-    finally:
-        conn.close()
 
 
-def get_user(user_id: int):
-    conn = db()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
-        user = cur.fetchone()
-        cur.close()
-        return user
-    finally:
-        conn.close()
+def get_user(user_id):
+
+    with db() as conn:
+
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE id=%s
+                """,
+                (user_id,)
+            )
+
+            return cur.fetchone()
 
 
-def get_balance(user_id: int) -> int:
-    user = get_user(user_id)
-    if not user:
-        ensure_user(user_id)
+def get_balance(user_id):
+
+    row = get_user(user_id)
+
+    if not row:
         return 0
-    return int(user["stars"])
+
+    return int(row["balance"])
 
 
-def change_balance(user_id: int, amount: int, allow_negative=False):
-    """
-    Atomic balance update.
-    Returns new balance or None if user doesn't exist / insufficient funds.
-    """
-    conn = db()
-    try:
-        cur = conn.cursor()
+# ============================================================
+# BALANCE
+# ============================================================
 
-        if allow_negative:
-            cur.execute("""
+def add_balance(
+    user_id,
+    amount,
+    kind,
+    description=""
+):
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT balance
+                FROM users
+                WHERE id=%s
+                FOR UPDATE
+                """,
+                (user_id,)
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+                raise ValueError(
+                    "Пользователь не найден"
+                )
+
+            old_balance = int(row[0])
+
+            new_balance = old_balance + amount
+
+            if new_balance < 0:
+                raise ValueError(
+                    "Недостаточно звёзд"
+                )
+
+            cur.execute(
+                """
                 UPDATE users
-                SET stars = stars + %s
-                WHERE user_id=%s
-                RETURNING stars
-            """, (amount, user_id))
-        else:
-            cur.execute("""
-                UPDATE users
-                SET stars = stars + %s
-                WHERE user_id=%s AND stars + %s >= 0
-                RETURNING stars
-            """, (amount, user_id, amount))
 
-        result = cur.fetchone()
+                SET
+                    balance=%s,
+                    updated_at=NOW()
 
-        if not result:
-            conn.rollback()
-            return None
+                WHERE id=%s
+                """,
+                (
+                    new_balance,
+                    user_id
+                )
+            )
+
+            cur.execute(
+                """
+                INSERT INTO transactions(
+                    user_id,
+                    amount,
+                    balance_after,
+                    kind,
+                    description
+                )
+
+                VALUES(
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    user_id,
+                    amount,
+                    new_balance,
+                    kind,
+                    description
+                )
+            )
 
         conn.commit()
-        return int(result[0])
-    finally:
-        conn.close()
+
+        return new_balance
 
 
-def get_inventory(user_id: int):
-    user = get_user(user_id)
-    if not user:
-        return []
+def charge_case(
+    user_id,
+    case_name,
+    price
+):
 
-    try:
-        data = json.loads(user["inventory"] or "[]")
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    with db() as conn:
 
+        with conn.cursor() as cur:
 
-def add_inventory(user_id: int, item: dict):
-    conn = db()
-    try:
-        cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT balance
 
-        cur.execute("SELECT inventory FROM users WHERE user_id=%s FOR UPDATE", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            conn.rollback()
-            return False
+                FROM users
 
-        try:
-            inventory = json.loads(row[0] or "[]")
-            if not isinstance(inventory, list):
-                inventory = []
-        except Exception:
-            inventory = []
+                WHERE id=%s
 
-        inventory.append(item)
+                FOR UPDATE
+                """,
+                (user_id,)
+            )
 
-        cur.execute("""
-            UPDATE users
-            SET inventory=%s
-            WHERE user_id=%s
-        """, (json.dumps(inventory, ensure_ascii=False), user_id))
+            row = cur.fetchone()
+
+            if not row:
+                raise ValueError(
+                    "Пользователь не найден"
+                )
+
+            balance = int(row[0])
+
+            if balance < price:
+                raise ValueError(
+                    "Недостаточно звёзд"
+                )
+
+            new_balance = balance - price
+
+            cur.execute(
+                """
+                UPDATE users
+
+                SET
+                    balance=%s,
+                    updated_at=NOW()
+
+                WHERE id=%s
+                """,
+                (
+                    new_balance,
+                    user_id
+                )
+            )
+
+            cur.execute(
+                """
+                INSERT INTO transactions(
+                    user_id,
+                    amount,
+                    balance_after,
+                    kind,
+                    description
+                )
+
+                VALUES(
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    user_id,
+                    -price,
+                    new_balance,
+                    "case",
+                    case_name
+                )
+            )
 
         conn.commit()
-        return True
-    finally:
-        conn.close()
+
+        return new_balance
 
 
-def get_all_users():
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users ORDER BY user_id")
-        result = [int(row[0]) for row in cur.fetchall()]
-        cur.close()
-        return result
-    finally:
-        conn.close()
+# ============================================================
+# CASE HISTORY
+# ============================================================
 
+def record_case(
+    user_id,
+    case_name,
+    price,
+    result,
+    reward_stars=0,
+    nft_inventory_id=None
+):
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO case_opens(
+                    user_id,
+                    case_name,
+                    price,
+                    result,
+                    reward_stars,
+                    nft_inventory_id
+                )
+
+                VALUES(
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    user_id,
+                    case_name,
+                    price,
+                    result,
+                    reward_stars,
+                    nft_inventory_id
+                )
+            )
+
+        conn.commit()
+
+
+# ============================================================
+# NFT
+# ============================================================
+
+def create_nft(
+    user_id,
+    nft_name,
+    source_case
+):
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO nft_inventory(
+                    user_id,
+                    nft_name,
+                    source_case
+                )
+
+                VALUES(
+                    %s,
+                    %s,
+                    %s
+                )
+
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    nft_name,
+                    source_case
+                )
+            )
+
+            nft_id = cur.fetchone()[0]
+
+        conn.commit()
+
+        return int(nft_id)
+
+
+def get_inventory(user_id):
+
+    with db() as conn:
+
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    nft_name,
+                    source_case,
+                    status,
+                    created_at
+
+                FROM nft_inventory
+
+                WHERE
+                    user_id=%s
+                    AND status='pending'
+
+                ORDER BY id DESC
+                """,
+                (user_id,)
+            )
+
+            return cur.fetchall()
+
+
+def get_pending_nfts():
+
+    with db() as conn:
+
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT
+                    n.id,
+                    n.user_id,
+                    n.nft_name,
+                    n.source_case,
+                    n.created_at,
+
+                    u.username,
+                    u.first_name
+
+                FROM nft_inventory n
+
+                JOIN users u
+                ON u.id=n.user_id
+
+                WHERE n.status='pending'
+
+                ORDER BY n.id ASC
+                """
+            )
+
+            return cur.fetchall()
+
+
+def deliver_nft(nft_id):
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                UPDATE nft_inventory
+
+                SET
+                    status='delivered',
+                    delivered_at=NOW()
+
+                WHERE
+                    id=%s
+                    AND status='pending'
+
+                RETURNING
+                    user_id,
+                    nft_name
+                """,
+                (nft_id,)
+            )
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+        return row
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
 
 def get_stats():
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM users")
-        users, stars = cur.fetchone()
 
-        cur.execute("SELECT COUNT(*) FROM opening_history")
-        openings = cur.fetchone()[0]
+    with db() as conn:
 
-        cur.execute("SELECT COUNT(*) FROM cases WHERE enabled=TRUE")
-        enabled_cases = cur.fetchone()[0]
+        with conn.cursor() as cur:
 
-        cur.close()
-        return int(users), int(stars), int(openings), int(enabled_cases)
-    finally:
-        conn.close()
-
-
-# ============================================================
-# CASES / HISTORY
-# ============================================================
-
-def case_info(case_id):
-    conn = db()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM cases WHERE case_id=%s", (case_id,))
-        result = cur.fetchone()
-        cur.close()
-        return result
-    finally:
-        conn.close()
-
-
-def is_enabled(case_id):
-    case = case_info(case_id)
-    return bool(case and case["enabled"])
-
-
-def set_case_enabled(case_id, enabled):
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE cases SET enabled=%s WHERE case_id=%s",
-            (bool(enabled), case_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def save_history(user_id, case, prize, price):
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO opening_history(
-                user_id, case_id, case_name,
-                prize_name, prize_type, price
+            cur.execute(
+                "SELECT COUNT(*) FROM users"
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            user_id,
-            case["case_id"],
-            case["name"],
-            prize["name"],
-            prize["type"],
-            price,
-        ))
-        conn.commit()
-    finally:
-        conn.close()
+
+            users = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT COALESCE(
+                    SUM(balance),
+                    0
+                )
+
+                FROM users
+                """
+            )
+
+            stars = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+
+                FROM nft_inventory
+
+                WHERE status='pending'
+                """
+            )
+
+            pending = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM case_opens
+                """
+            )
+
+            opens = cur.fetchone()[0]
+
+            return (
+                users,
+                stars,
+                pending,
+                opens
+            )
 
 
 # ============================================================
-# USER LOCK
+# HELPERS
 # ============================================================
 
-def get_user_lock(user_id):
-    with user_locks_lock:
-        if user_id not in user_locks:
-            user_locks[user_id] = threading.Lock()
-        return user_locks[user_id]
+def money(number):
 
-
-# ============================================================
-# UI
-# ============================================================
-
-def main_keyboard(user_id):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    kb.add(
-        types.InlineKeyboardButton("🎁 КЕЙСЫ", callback_data="cases"),
-        types.InlineKeyboardButton("👤 ПРОФИЛЬ", callback_data="profile"),
+    return f"{int(number):,}".replace(
+        ",",
+        " "
     )
-    kb.add(
-        types.InlineKeyboardButton("🎒 ИНВЕНТАРЬ", callback_data="inventory"),
-        types.InlineKeyboardButton("⭐ ПОПОЛНИТЬ", callback_data="topup"),
+
+
+def is_admin(user):
+
+    if user.id in ADMIN_IDS:
+        return True
+
+    username = (
+        user.username or ""
+    ).lower().lstrip("@")
+
+    return username in ADMIN_USERNAMES
+
+
+def admin_list_text():
+
+    return (
+        "• @doxme\n"
+        "• @bogkm\n"
+        "• @modeevil"
     )
 
-    if user_id in ADMINS:
-        kb.add(types.InlineKeyboardButton("👑 АДМИН-ПАНЕЛЬ", callback_data="admin"))
 
-    return kb
+def user_display(user):
+
+    if user.username:
+        return f"@{user.username}"
+
+    return (
+        user.first_name
+        or str(user.id)
+    )
 
 
-def home_keyboard(user_id):
-    return main_keyboard(user_id)
+def user_label(row):
+
+    if row.get("username"):
+        return f"@{row['username']}"
+
+    return (
+        row.get("first_name")
+        or str(row.get("id"))
+    )
 
 
-def back_keyboard(target="home"):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=target))
-    return kb
+# ============================================================
+# ADMIN NOTIFICATIONS
+# ============================================================
+
+def notify_admins(text):
+
+    sent = 0
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+
+            bot.send_message(
+                admin_id,
+                text
+            )
+
+            sent += 1
+
+        except Exception as error:
+
+            logging.warning(
+                "Не удалось отправить уведомление "
+                "админу %s: %s",
+                admin_id,
+                error
+            )
+
+    return sent
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_keyboard():
+
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2
+    )
+
+    keyboard.add(
+        types.KeyboardButton(
+            "🎁 Кейсы"
+        ),
+        types.KeyboardButton(
+            "💰 Баланс"
+        )
+    )
+
+    keyboard.add(
+        types.KeyboardButton(
+            "🎒 Инвентарь"
+        ),
+        types.KeyboardButton(
+            "💳 Пополнить ⭐"
+        )
+    )
+
+    keyboard.add(
+        types.KeyboardButton(
+            "ℹ️ Помощь"
+        )
+    )
+
+    return keyboard
 
 
 def cases_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=1)
 
-    for case_id in ["bileter", "risk", "luxury", "narkoman", "colors"]:
-        case = case_info(case_id)
-        if not case or not case["enabled"]:
-            continue
-
-        price = int(case["price"])
-        if case_id == "risk":
-            label = f"{case['name']} — 🎯 Ставка"
-        else:
-            label = f"{case['name']} — {price:,} ⭐".replace(",", " ")
-
-        kb.add(types.InlineKeyboardButton(
-            label,
-            callback_data=f"open:{case_id}"
-        ))
-
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="home"))
-    return kb
-
-
-def color_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        types.InlineKeyboardButton("🔴", callback_data="color:red"),
-        types.InlineKeyboardButton("🔵", callback_data="color:blue"),
-        types.InlineKeyboardButton("🟡", callback_data="color:yellow"),
+    keyboard = types.InlineKeyboardMarkup(
+        row_width=1
     )
-    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cases"))
-    return kb
 
-
-def admin_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    kb.add(
-        types.InlineKeyboardButton("⭐ Выдать", callback_data="admin:add"),
-        types.InlineKeyboardButton("➖ Снять", callback_data="admin:remove"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("👤 Пользователь", callback_data="admin:user"),
-        types.InlineKeyboardButton("🎁 Кейсы", callback_data="admin:cases"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
-        types.InlineKeyboardButton("📜 История", callback_data="admin:history"),
-    )
-    kb.add(types.InlineKeyboardButton("📢 Рассылка", callback_data="admin:broadcast"))
-    kb.add(types.InlineKeyboardButton("⬅️ Главное меню", callback_data="home"))
-    return kb
-
-
-def admin_cases_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-
-    for case_id in ["bileter", "risk", "luxury", "narkoman", "colors"]:
-        case = case_info(case_id)
-        if not case:
-            continue
-
-        status = "🟢 ВКЛЮЧЕН" if case["enabled"] else "🔴 ВЫКЛЮЧЕН"
-        price = int(case["price"])
-
-        kb.add(types.InlineKeyboardButton(
-            f"{case['name']} • {price:,} ⭐ • {status}".replace(",", " "),
-            callback_data=f"toggle:{case_id}"
-        ))
-
-    kb.add(types.InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin"))
-    return kb
-
-
-# ============================================================
-# TEXT
-# ============================================================
-
-HOME_TEXT = """
-<b>🎁 CASES WAVEGRAM</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Добро пожаловать в кейс-сервис.
-
-🎁 Открывай кейсы
-⭐ Играй за звёзды
-🎒 Забирай призы в инвентарь
-
-Выбери раздел ниже 👇
-"""
-
-
-def profile_text(user_id):
-    user = get_user(user_id) or ensure_user(user_id)
-    inventory = get_inventory(user_id)
-    username = f"@{user['username']}" if user["username"] else "не указан"
-
-    return f"""
-<b>👤 ПРОФИЛЬ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🆔 ID: <code>{user_id}</code>
-👤 Username: {username}
-
-⭐ Баланс: <b>{int(user['stars']):,}</b>
-🎒 Предметов: <b>{len(inventory)}</b>
-""".replace(",", " ")
-
-
-def inventory_text(user_id):
-    inventory = get_inventory(user_id)
-
-    if not inventory:
-        return """
-<b>🎒 ИНВЕНТАРЬ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Пока пусто.
-
-Открывай кейсы и получай призы 🎁
-"""
-
-    text = "<b>🎒 ИНВЕНТАРЬ</b>\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    for i, item in enumerate(inventory[-30:], 1):
-        text += (
-            f"<b>{i}.</b> {item.get('name', 'Предмет')}\n"
-            f"   └ {item.get('type', 'item')}\n\n"
+    keyboard.add(
+        types.InlineKeyboardButton(
+            f"🎟 Билитер — {BILITER_PRICE} ⭐",
+            callback_data="case:biliter"
         )
+    )
 
-    return text
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "🍬 Ириски риски",
+            callback_data="case:iriski"
+        )
+    )
 
+    keyboard.add(
+        types.InlineKeyboardButton(
+            f"💎 Лакшери — {LUXURY_PRICE} ⭐",
+            callback_data="case:luxury"
+        )
+    )
 
-def topup_text():
-    contacts = "\n".join(f"👤 {x}" for x in TOP_UP_CONTACTS)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            f"👁 Наркоман — {NARKOMAN_PRICE} ⭐",
+            callback_data="case:narkoman"
+        )
+    )
 
-    return f"""
-<b>⭐ ПОПОЛНЕНИЕ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Для пополнения напиши продавцу:
-
-{contacts}
-
-После оплаты отправь продавцу свой Telegram ID.
-
-🆔 ID можно посмотреть в разделе «Профиль».
-"""
-
-
-# ============================================================
-# PRIZES
-# ============================================================
-
-def bileter_prize():
-    if random.random() < 0.02:
-        return {"name": "🥇 Золотой билет", "type": "NFT", "valuable": True}
-
-    return {
-        "name": "🎫 Обычный билет",
-        "type": "stars",
-        "stars": 50,
-        "valuable": False,
-    }
-
-
-def narkoman_prize():
-    if random.random() < 0.50:
-        return {
-            "name": "⭐ 50 звёзд",
-            "type": "stars",
-            "stars": 50,
-            "valuable": False,
-        }
-
-    return {"name": "👁️ NFT Глазик", "type": "NFT", "valuable": True}
-
-
-def luxury_prize():
-    return {
-        "name": random.choice([
-            "🎁 Wavegram Gift #1",
-            "🎁 Wavegram Gift #2",
-            "🎁 Wavegram Gift #3",
-            "💎 Wavegram Luxury Gift",
-            "👑 Wavegram Premium Gift",
-        ]),
-        "type": "Gift",
-        "valuable": True,
-    }
-
-
-# ============================================================
-# ADMIN NOTIFICATION
-# ============================================================
-
-def notify_admins_win(user_id, username, case_name, prize):
-    text = f"""
-<b>🚨 ЦЕННЫЙ ВЫИГРЫШ</b>
-
-👤 <code>{user_id}</code>
-{('@' + username) if username else 'без username'}
-
-🎁 {case_name}
-🏆 <b>{prize}</b>
-"""
-
-    for admin_id in ADMINS:
-        try:
-            bot.send_message(admin_id, text)
-        except Exception:
-            pass
+    return keyboard
 
 
 # ============================================================
 # START
 # ============================================================
 
-@bot.message_handler(commands=["start"])
+@bot.message_handler(
+    commands=["start"]
+)
 def start(message):
-    u = message.from_user
-    ensure_user(u.id, u.username, u.first_name)
+
+    ensure_user(
+        message.from_user
+    )
 
     bot.send_message(
         message.chat.id,
-        HOME_TEXT,
-        reply_markup=main_keyboard(u.id),
+
+        "👋 <b>Добро пожаловать "
+        "в Wavegram Cases!</b>\n\n"
+
+        "Здесь ты можешь покупать "
+        "игровые ⭐ и открывать кейсы.\n\n"
+
+        "🎁 Кейсы\n"
+        "💰 Баланс\n"
+        "🎒 Инвентарь\n"
+        "💳 Пополнение\n\n"
+
+        "Удачи! 🍀",
+
+        reply_markup=main_keyboard()
     )
 
 
 # ============================================================
-# CALLBACKS
+# ID
 # ============================================================
 
-@bot.callback_query_handler(func=lambda call: True)
-def callbacks(call):
-    user_id = call.from_user.id
-    u = call.from_user
+@bot.message_handler(
+    commands=["id"]
+)
+def show_id(message):
 
-    ensure_user(user_id, u.username, u.first_name)
+    ensure_user(
+        message.from_user
+    )
+
+    bot.reply_to(
+        message,
+
+        f"🆔 Telegram ID: "
+        f"<code>{message.from_user.id}</code>\n"
+
+        f"👤 Username: "
+        f"<code>@"
+        f"{message.from_user.username or 'нет'}"
+        f"</code>"
+    )
+
+
+# ============================================================
+# BALANCE
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == "💰 Баланс"
+)
+def balance(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    amount = get_balance(
+        message.from_user.id
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        f"💰 <b>Твой баланс:</b>\n\n"
+        f"⭐ <b>{money(amount)}</b>",
+
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# CASES
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == "🎁 Кейсы"
+)
+def cases(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        "🎁 <b>Кейсы</b>\n\n"
+
+        f"🎟 <b>Билитер</b>\n"
+        f"Цена: {BILITER_PRICE} ⭐\n"
+        f"Обычный билет: +{BILITER_NORMAL_REWARD} ⭐\n"
+        "Редко выпадает 🏆 Золотой билет NFT.\n\n"
+
+        "🍬 <b>Ириски риски</b>\n"
+        "Сам выбираешь размер ставки.\n"
+        f"При победе выплата x{IRISKI_MULTIPLIER}.\n\n"
+
+        f"💎 <b>Лакшери</b>\n"
+        f"Цена: {LUXURY_PRICE} ⭐\n"
+        "Лучшие GIFTS сервера.\n\n"
+
+        f"👁 <b>Наркоман</b>\n"
+        f"Цена: {NARKOMAN_PRICE} ⭐\n"
+        f"Награда: {NARKOMAN_REWARD} ⭐ "
+        "или NFT «Глазик».",
+
+        reply_markup=cases_keyboard()
+    )
+
+
+# ============================================================
+# INVENTORY
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == "🎒 Инвентарь"
+)
+def inventory(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    items = get_inventory(
+        message.from_user.id
+    )
+
+    if not items:
+
+        bot.send_message(
+            message.chat.id,
+
+            "🎒 <b>Инвентарь пуст.</b>",
+
+            reply_markup=main_keyboard()
+        )
+
+        return
+
+    text = (
+        "🎒 <b>Твой инвентарь:</b>\n\n"
+    )
+
+    for item in items:
+
+        text += (
+            f"🆔 #{item['id']}\n"
+            f"🎁 <b>{item['nft_name']}</b>\n"
+            f"📦 Кейс: {item['source_case']}\n"
+            "⏳ Статус: ожидает выдачи\n\n"
+        )
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# TOP UP
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == "💳 Пополнить ⭐"
+)
+def topup(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        "💳 <b>Пополнение баланса</b>\n\n"
+
+        "Для пополнения обратись к одному "
+        "из администраторов:\n\n"
+
+        f"{admin_list_text()}\n\n"
+
+        "Обязательно отправь админу:\n"
+        "• сумму\n"
+        "• свой Telegram ID\n\n"
+
+        "Получить ID можно командой "
+        "<code>/id</code>.\n\n"
+
+        "После проверки администратор "
+        "зачислит ⭐ на баланс.",
+
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == "ℹ️ Помощь"
+)
+def help_menu(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        "ℹ️ <b>Помощь</b>\n\n"
+
+        "⭐ — игровая валюта.\n"
+        "🎁 Кейсы — открытие кейсов.\n"
+        "🎒 Инвентарь — полученные NFT.\n"
+        "💳 Пополнить — инструкция.\n\n"
+
+        "Если тебе выпал NFT, он появится "
+        "в инвентаре со статусом "
+        "«ожидает выдачи».\n\n"
+
+        "После фактической выдачи администратор "
+        "подтвердит его через админ-панель.",
+
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# БИЛИТЕР
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call:
+        call.data == "case:biliter"
+)
+def open_biliter(call):
+
+    ensure_user(
+        call.from_user
+    )
 
     try:
-        bot.answer_callback_query(call.id)
+
+        charge_case(
+            call.from_user.id,
+            "Билитер",
+            BILITER_PRICE
+        )
+
+    except ValueError:
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Недостаточно ⭐",
+            show_alert=True
+        )
+
+        return
+
+    # ЗОЛОТОЙ БИЛЕТ
+
+    if random.random() < BILITER_GOLD_CHANCE:
+
+        nft_id = create_nft(
+            call.from_user.id,
+            "Золотой билет",
+            "Билитер"
+        )
+
+        record_case(
+            call.from_user.id,
+            "Билитер",
+            BILITER_PRICE,
+            "Золотой билет NFT",
+            0,
+            nft_id
+        )
+
+        bot.answer_callback_query(
+            call.id,
+            "🏆 ЗОЛОТОЙ БИЛЕТ!",
+            show_alert=True
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+
+            "🎉 <b>НЕВЕРОЯТНО!</b>\n\n"
+
+            "🏆 Тебе выпал "
+            "<b>Золотой билет NFT!</b>\n\n"
+
+            f"🆔 Inventory ID: "
+            f"<code>#{nft_id}</code>\n\n"
+
+            "NFT добавлен в инвентарь.\n"
+            "Ожидай выдачу администратора."
+        )
+
+        notify_admins(
+
+            "🚨 <b>ВЫПАЛ NFT!</b>\n\n"
+
+            f"👤 Игрок: "
+            f"<b>{user_display(call.from_user)}</b>\n"
+
+            f"🆔 ID: "
+            f"<code>{call.from_user.id}</code>\n\n"
+
+            "🎁 Кейс: Билитер\n"
+            "🏆 NFT: Золотой билет\n"
+
+            f"🆔 Inventory ID: "
+            f"<code>#{nft_id}</code>"
+        )
+
+        return
+
+    # ОБЫЧНЫЙ БИЛЕТ
+
+    reward = BILITER_NORMAL_REWARD
+
+    add_balance(
+        call.from_user.id,
+        reward,
+        "case_reward",
+        "Билитер: обычный билет"
+    )
+
+    record_case(
+        call.from_user.id,
+        "Билитер",
+        BILITER_PRICE,
+        "Обычный билет",
+        reward
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "🎟 Обычный билет!",
+        show_alert=True
+    )
+
+    bot.send_message(
+        call.message.chat.id,
+
+        "🎟 <b>Выпал обычный билет!</b>\n\n"
+
+        f"💰 Награда: "
+        f"<b>+{reward} ⭐</b>\n\n"
+
+        f"💰 Баланс: "
+        f"<b>{money(get_balance(call.from_user.id))} ⭐</b>"
+    )
+
+
+# ============================================================
+# ИРИСКИ РИСКИ
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call:
+        call.data == "case:iriski"
+)
+def iriski_menu(call):
+
+    ensure_user(
+        call.from_user
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    bot.send_message(
+        call.message.chat.id,
+
+        "🍬 <b>Ириски риски</b>\n\n"
+
+        f"Минимум: "
+        f"<b>{IRISKI_MIN_BET} ⭐</b>\n"
+
+        f"Максимум: "
+        f"<b>{money(IRISKI_MAX_BET)} ⭐</b>\n"
+
+        f"Шанс победы: "
+        f"<b>{IRISKI_WIN_CHANCE * 100:.2f}%</b>\n"
+
+        f"Победа: "
+        f"<b>x{IRISKI_MULTIPLIER}</b>\n\n"
+
+        "Для игры напиши:\n"
+        "<code>/risk 100</code>"
+    )
+
+
+@bot.message_handler(
+    commands=["risk"]
+)
+def risk(message):
+
+    ensure_user(
+        message.from_user
+    )
+
+    parts = message.text.split()
+
+    if (
+        len(parts) != 2
+        or not parts[1].isdigit()
+    ):
+
+        bot.reply_to(
+            message,
+
+            "❌ Использование:\n"
+            "<code>/risk 100</code>"
+        )
+
+        return
+
+    bet = int(parts[1])
+
+    if (
+        bet < IRISKI_MIN_BET
+        or bet > IRISKI_MAX_BET
+    ):
+
+        bot.reply_to(
+            message,
+
+            f"❌ Ставка от "
+            f"{IRISKI_MIN_BET} "
+            f"до "
+            f"{money(IRISKI_MAX_BET)} ⭐."
+        )
+
+        return
+
+    if get_balance(
+        message.from_user.id
+    ) < bet:
+
+        bot.reply_to(
+            message,
+            "❌ Недостаточно ⭐."
+        )
+
+        return
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO pending_iriski(
+                    user_id,
+                    bet
+                )
+
+                VALUES(
+                    %s,
+                    %s
+                )
+
+                ON CONFLICT(user_id)
+
+                DO UPDATE SET
+                    bet=EXCLUDED.bet,
+                    created_at=NOW()
+                """,
+                (
+                    message.from_user.id,
+                    bet
+                )
+            )
+
+        conn.commit()
+
+    keyboard = types.InlineKeyboardMarkup(
+        row_width=2
+    )
+
+    keyboard.add(
+
+        types.InlineKeyboardButton(
+            "🍬 ИРИСКА",
+            callback_data=(
+                f"risk:play:"
+                f"{message.from_user.id}"
+            )
+        ),
+
+        types.InlineKeyboardButton(
+            "💀 РИСК",
+            callback_data=(
+                f"risk:play:"
+                f"{message.from_user.id}"
+            )
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        f"🎲 Ставка: "
+        f"<b>{money(bet)} ⭐</b>\n\n"
+
+        "Нажми кнопку и узнай результат:",
+
+        reply_markup=keyboard
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call:
+        call.data.startswith(
+            "risk:play:"
+        )
+)
+def risk_play(call):
+
+    ensure_user(
+        call.from_user
+    )
+
+    try:
+
+        target_id = int(
+            call.data.split(":")[2]
+        )
+
+    except Exception:
+
+        bot.answer_callback_query(
+            call.id,
+            "Ошибка ставки",
+            show_alert=True
+        )
+
+        return
+
+    if target_id != call.from_user.id:
+
+        bot.answer_callback_query(
+            call.id,
+            "Это не твоя ставка.",
+            show_alert=True
+        )
+
+        return
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT bet
+
+                FROM pending_iriski
+
+                WHERE user_id=%s
+
+                FOR UPDATE
+                """,
+                (target_id,)
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+
+                bot.answer_callback_query(
+                    call.id,
+                    "Ставка уже сыграна.",
+                    show_alert=True
+                )
+
+                return
+
+            bet = int(row[0])
+
+            cur.execute(
+                """
+                DELETE FROM pending_iriski
+
+                WHERE user_id=%s
+                """,
+                (target_id,)
+            )
+
+        conn.commit()
+
+    try:
+
+        charge_case(
+            target_id,
+            "Ириски риски",
+            bet
+        )
+
+    except ValueError:
+
+        bot.answer_callback_query(
+            call.id,
+            "Недостаточно ⭐",
+            show_alert=True
+        )
+
+        return
+
+    win = (
+        random.random()
+        < IRISKI_WIN_CHANCE
+    )
+
+    if win:
+
+        reward = (
+            bet
+            * IRISKI_MULTIPLIER
+        )
+
+        add_balance(
+            target_id,
+            reward,
+            "risk_reward",
+            "Ириски риски: победа"
+        )
+
+        record_case(
+            target_id,
+            "Ириски риски",
+            bet,
+            "Победа",
+            reward
+        )
+
+        bot.answer_callback_query(
+            call.id,
+            "🍬 ИРИСКА! ПОБЕДА!",
+            show_alert=True
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+
+            "🍬 <b>ИРИСКА!</b>\n\n"
+
+            f"🎲 Ставка: "
+            f"{money(bet)} ⭐\n"
+
+            f"💰 Выигрыш: "
+            f"<b>+{money(reward)} ⭐</b>\n\n"
+
+            f"💰 Баланс: "
+            f"<b>{money(get_balance(target_id))} ⭐</b>"
+        )
+
+    else:
+
+        record_case(
+            target_id,
+            "Ириски риски",
+            bet,
+            "Проигрыш",
+            0
+        )
+
+        bot.answer_callback_query(
+            call.id,
+            "💀 ПРОИГРЫШ!",
+            show_alert=True
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+
+            "💀 <b>ПРОИГРАННЫЙ РИСК</b>\n\n"
+
+            f"Потеряно: "
+            f"<b>{money(bet)} ⭐</b>\n\n"
+
+            f"Баланс: "
+            f"<b>{money(get_balance(target_id))} ⭐</b>"
+        )
+
+
+# ============================================================
+# ЛАКШЕРИ
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call:
+        call.data == "case:luxury"
+)
+def open_luxury(call):
+
+    ensure_user(
+        call.from_user
+    )
+
+    try:
+
+        charge_case(
+            call.from_user.id,
+            "Лакшери",
+            LUXURY_PRICE
+        )
+
+    except ValueError:
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Недостаточно ⭐",
+            show_alert=True
+        )
+
+        return
+
+    gift = random.choice(
+        LUXURY_GIFTS
+    )
+
+    nft_id = create_nft(
+        call.from_user.id,
+        gift,
+        "Лакшери"
+    )
+
+    record_case(
+        call.from_user.id,
+        "Лакшери",
+        LUXURY_PRICE,
+        gift,
+        0,
+        nft_id
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "💎 LUXURY!",
+        show_alert=True
+    )
+
+    bot.send_message(
+        call.message.chat.id,
+
+        "💎 <b>ЛАКШЕРИ!</b>\n\n"
+
+        f"🎁 Выпал: "
+        f"<b>{gift}</b>\n\n"
+
+        f"🆔 Inventory ID: "
+        f"<code>#{nft_id}</code>\n\n"
+
+        "Предмет добавлен в инвентарь.\n"
+        "Ожидай выдачу администратора."
+    )
+
+    notify_admins(
+
+        "🚨 <b>ВЫПАЛ LUXURY NFT!</b>\n\n"
+
+        f"👤 Игрок: "
+        f"<b>{user_display(call.from_user)}</b>\n"
+
+        f"🆔 ID: "
+        f"<code>{call.from_user.id}</code>\n\n"
+
+        f"🎁 Gift: <b>{gift}</b>\n"
+
+        f"🆔 Inventory ID: "
+        f"<code>{nft_id}</code>"
+    )
+
+
+# ============================================================
+# НАРКОМАН
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call:
+        call.data == "case:narkoman"
+)
+def open_narkoman(call):
+
+    ensure_user(
+        call.from_user
+    )
+
+    try:
+
+        charge_case(
+            call.from_user.id,
+            "Наркоман",
+            NARKOMAN_PRICE
+        )
+
+    except ValueError:
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Недостаточно ⭐",
+            show_alert=True
+        )
+
+        return
+
+    # ГЛАЗИК
+
+    if random.random() < NARKOMAN_NFT_CHANCE:
+
+        nft_id = create_nft(
+            call.from_user.id,
+            "Глазик",
+            "Наркоман"
+        )
+
+        record_case(
+            call.from_user.id,
+            "Наркоман",
+            NARKOMAN_PRICE,
+            "Глазик NFT",
+            0,
+            nft_id
+        )
+
+        bot.answer_callback_query(
+            call.id,
+            "👁 ГЛАЗИК!",
+            show_alert=True
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+
+            "👁 <b>ТЕБЕ ВЫПАЛ ГЛАЗИК!</b>\n\n"
+
+            f"🆔 Inventory ID: "
+            f"<code>#{nft_id}</code>\n\n"
+
+            "NFT добавлен в инвентарь.\n"
+            "Ожидай выдачу администратора."
+        )
+
+        notify_admins(
+
+            "🚨 <b>ВЫПАЛ NFT!</b>\n\n"
+
+            f"👤 Игрок: "
+            f"<b>{user_display(call.from_user)}</b>\n"
+
+            f"🆔 ID: "
+            f"<code>{call.from_user.id}</code>\n\n"
+
+            "🎁 Кейс: Наркоман\n"
+            "👁 NFT: Глазик\n"
+
+            f"🆔 Inventory ID: "
+            f"<code>{nft_id}</code>"
+        )
+
+        return
+
+    # ЗВЁЗДЫ
+
+    reward = NARKOMAN_REWARD
+
+    add_balance(
+        call.from_user.id,
+        reward,
+        "case_reward",
+        "Наркоман: звёзды"
+    )
+
+    record_case(
+        call.from_user.id,
+        "Наркоман",
+        NARKOMAN_PRICE,
+        "Звёзды",
+        reward
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        f"+{reward} ⭐",
+        show_alert=True
+    )
+
+    bot.send_message(
+        call.message.chat.id,
+
+        f"💰 Выпало "
+        f"<b>+{reward} ⭐</b>!\n\n"
+
+        f"Баланс: "
+        f"<b>{money(get_balance(call.from_user.id))} ⭐</b>"
+    )
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+@bot.message_handler(
+    commands=["admin"]
+)
+def admin_panel(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ У тебя нет доступа."
+        )
+
+        return
+
+    bot.send_message(
+        message.chat.id,
+
+        "🛠 <b>Админ-панель</b>\n\n"
+
+        "💰 <code>/give ID СУММА</code>\n"
+        "Сделать игроку начисление ⭐.\n\n"
+
+        "💸 <code>/take ID СУММА</code>\n"
+        "Снять ⭐.\n\n"
+
+        "👤 <code>/user ID</code>\n"
+        "Информация об игроке.\n\n"
+
+        "🎒 <code>/nft_pending</code>\n"
+        "NFT, ожидающие выдачи.\n\n"
+
+        "✅ <code>/nft_done ID</code>\n"
+        "Подтвердить выдачу NFT.\n\n"
+
+        "📊 <code>/stats</code>\n"
+        "Статистика.\n\n"
+
+        "📢 <code>/broadcast ТЕКСТ</code>\n"
+        "Рассылка игрокам."
+    )
+
+
+# ============================================================
+# GIVE
+# ============================================================
+
+@bot.message_handler(
+    commands=["give"]
+)
+def admin_give(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 3:
+
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "<code>/give 123456789 500</code>"
+        )
+
+        return
+
+    try:
+
+        user_id = int(parts[1])
+        amount = int(parts[2])
+
+        if amount <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        bot.reply_to(
+            message,
+            "❌ Неверный ID или сумма."
+        )
+
+        return
+
+    if not get_user(user_id):
+
+        bot.reply_to(
+            message,
+            "❌ Игрок не найден.\n"
+            "Он должен сначала нажать /start."
+        )
+
+        return
+
+    new_balance = add_balance(
+        user_id,
+        amount,
+        "admin_give",
+        f"Админ {message.from_user.id}"
+    )
+
+    bot.reply_to(
+        message,
+
+        f"✅ Игроку начислено "
+        f"<b>+{money(amount)} ⭐</b>\n\n"
+
+        f"Новый баланс: "
+        f"<b>{money(new_balance)} ⭐</b>"
+    )
+
+    try:
+
+        bot.send_message(
+            user_id,
+
+            "💰 <b>Пополнение</b>\n\n"
+
+            f"Тебе начислено "
+            f"<b>+{money(amount)} ⭐</b>\n\n"
+
+            f"Баланс: "
+            f"<b>{money(new_balance)} ⭐</b>"
+        )
+
     except Exception:
         pass
 
-    data = call.data or ""
-
-    # HOME
-    if data == "home":
-        try:
-            bot.edit_message_text(
-                HOME_TEXT,
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=main_keyboard(user_id),
-            )
-        except Exception:
-            bot.send_message(
-                call.message.chat.id,
-                HOME_TEXT,
-                reply_markup=main_keyboard(user_id),
-            )
-        return
-
-    # PROFILE
-    if data == "profile":
-        bot.edit_message_text(
-            profile_text(user_id),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    # INVENTORY
-    if data == "inventory":
-        bot.edit_message_text(
-            inventory_text(user_id),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    # TOPUP
-    if data == "topup":
-        bot.edit_message_text(
-            topup_text(),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    # CASES
-    if data == "cases":
-        text = """
-<b>🎁 КЕЙСЫ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🎫 Билетёр — 100 ⭐
-🍬 Ириски и риски — ставка
-💎 Лакшери — 2 000 ⭐
-🥤 Наркоман — 100 ⭐
-🔴🔵🟡 Цвет — 100 ⭐
-
-Выбери кейс 👇
-"""
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=cases_keyboard(),
-        )
-        return
-
-    # OPEN
-    if data.startswith("open:"):
-        open_case(call, data.split(":", 1)[1])
-        return
-
-    # COLORS
-    if data.startswith("color:"):
-        play_color(call, data.split(":", 1)[1])
-        return
-
-    # ADMIN
-    if data == "admin":
-        if user_id not in ADMINS:
-            bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
-            return
-
-        bot.edit_message_text(
-            """
-<b>👑 ADMIN CONTROL</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Управление ботом:
-
-⭐ Балансы
-👤 Пользователи
-🎁 Кейсы
-📊 Статистика
-📜 История
-📢 Рассылка
-""",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if data.startswith("admin:"):
-        if user_id not in ADMINS:
-            bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
-            return
-
-        admin_action(call, data.split(":", 1)[1])
-        return
-
-    if data.startswith("toggle:"):
-        if user_id not in ADMINS:
-            return
-
-        case_id = data.split(":", 1)[1]
-        case = case_info(case_id)
-        if not case:
-            return
-
-        set_case_enabled(case_id, not case["enabled"])
-
-        bot.edit_message_text(
-            "<b>🎁 УПРАВЛЕНИЕ КЕЙСАМИ</b>\n\nСтатус обновлён.",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_cases_keyboard(),
-        )
-
 
 # ============================================================
-# ADMIN ACTIONS
+# TAKE
 # ============================================================
 
-def admin_action(call, action):
-    user_id = call.from_user.id
+@bot.message_handler(
+    commands=["take"]
+)
+def admin_take(message):
 
-    if action == "add":
-        set_state(user_id, "admin_add")
-        bot.send_message(
-            user_id,
-            "<b>⭐ ВЫДАТЬ ЗВЁЗДЫ</b>\n\n"
-            "Формат:\n<code>ID количество</code>\n\n"
-            "Пример:\n<code>123456789 500</code>",
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
         )
 
-    elif action == "remove":
-        set_state(user_id, "admin_remove")
-        bot.send_message(
-            user_id,
-            "<b>➖ СНЯТЬ ЗВЁЗДЫ</b>\n\n"
-            "Формат:\n<code>ID количество</code>",
-        )
-
-    elif action == "user":
-        set_state(user_id, "admin_user")
-        bot.send_message(
-            user_id,
-            "<b>👤 ПОЛЬЗОВАТЕЛЬ</b>\n\n"
-            "Отправь Telegram ID пользователя.",
-        )
-
-    elif action == "cases":
-        bot.edit_message_text(
-            "<b>🎁 УПРАВЛЕНИЕ КЕЙСАМИ</b>\n\n"
-            "Нажми на кейс, чтобы включить или выключить его:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_cases_keyboard(),
-        )
-
-    elif action == "stats":
-        users, stars, openings, enabled = get_stats()
-
-        bot.edit_message_text(
-            f"""
-<b>📊 СТАТИСТИКА</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-👥 Пользователей: <b>{users}</b>
-⭐ Всего звёзд: <b>{stars}</b>
-🎁 Открытий: <b>{openings}</b>
-🟢 Активных кейсов: <b>{enabled}</b>
-👑 Админов: <b>{len(ADMINS)}</b>
-""",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_keyboard(),
-        )
-
-    elif action == "history":
-        bot.send_message(
-            user_id,
-            "<b>📜 ИСТОРИЯ</b>\n\n"
-            "История открытий хранится в таблице "
-            "<code>opening_history</code> PostgreSQL.\n"
-            "Для просмотра конкретного пользователя отправь его ID через «Пользователь».",
-        )
-
-    elif action == "broadcast":
-        set_state(user_id, "broadcast")
-        bot.send_message(
-            user_id,
-            "<b>📢 BROADCAST</b>\n\n"
-            "Отправь текст сообщения для рассылки.\n\n"
-            "⚠️ Рассылка выполняется всем пользователям из базы.",
-        )
-
-
-# ============================================================
-# OPEN CASE
-# ============================================================
-
-def open_case(call, case_id):
-    user_id = call.from_user.id
-
-    if not is_enabled(case_id):
-        bot.answer_callback_query(
-            call.id,
-            "❌ Кейс сейчас выключен",
-            show_alert=True,
-        )
         return
 
-    case = case_info(case_id)
-    if not case:
-        bot.answer_callback_query(
-            call.id,
-            "❌ Кейс не найден",
-            show_alert=True,
+    parts = message.text.split()
+
+    if len(parts) != 3:
+
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "<code>/take 123456789 500</code>"
         )
-        return
 
-    # RISK
-    if case_id == "risk":
-        set_state(user_id, "risk_bet")
-        bot.send_message(
-            call.message.chat.id,
-            """
-<b>🍬 ИРИСКИ И РИСКИ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Введи ставку в ⭐.
-
-🎯 Победа: ставка × 2
-💥 Проигрыш: ставка сгорает
-
-Например:
-<code>100</code>
-""",
-            reply_markup=back_keyboard("cases"),
-        )
-        return
-
-    # COLORS
-    if case_id == "colors":
-        if get_balance(user_id) < 100:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Недостаточно ⭐",
-                show_alert=True,
-            )
-            return
-
-        # ВАЖНО: деньги списываются только один раз здесь.
-        new_balance = change_balance(user_id, -100)
-        if new_balance is None:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Недостаточно ⭐",
-                show_alert=True,
-            )
-            return
-
-        set_state(user_id, "color_game")
-
-        bot.send_message(
-            call.message.chat.id,
-            """
-<b>🔴 🔵 🟡 ЦВЕТ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Стоимость: <b>100 ⭐</b>
-
-В одном из трёх цветов находится NFT.
-
-Выбирай 👇
-""",
-            reply_markup=color_keyboard(),
-        )
-        return
-
-    price = int(case["price"])
-
-    # Atomic lock against double clicks.
-    lock = get_user_lock(user_id)
-    if not lock.acquire(blocking=False):
-        bot.answer_callback_query(
-            call.id,
-            "⏳ Подожди, кейс уже открывается",
-            show_alert=True,
-        )
         return
 
     try:
-        if get_balance(user_id) < price:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Недостаточно ⭐",
-                show_alert=True,
-            )
-            return
 
-        if change_balance(user_id, -price) is None:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Не удалось списать ⭐",
-                show_alert=True,
-            )
-            return
-
-        # Short animation.
-        try:
-            msg = bot.send_message(
-                call.message.chat.id,
-                "🎁 <b>Открываем кейс...</b>",
-            )
-
-            for emoji in ["🎁", "✨", "🎁", "💫", "🎁"]:
-                time.sleep(0.18)
-                try:
-                    bot.edit_message_text(
-                        f"<b>{emoji}</b>\n\nОткрываем...",
-                        msg.chat.id,
-                        msg.message_id,
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if case_id == "bileter":
-            prize = bileter_prize()
-        elif case_id == "narkoman":
-            prize = narkoman_prize()
-        elif case_id == "luxury":
-            prize = luxury_prize()
-        else:
-            prize = {
-                "name": "🎁 Приз",
-                "type": "Gift",
-                "valuable": True,
-            }
-
-        if prize.get("type") == "stars":
-            amount = int(prize["stars"])
-            change_balance(user_id, amount)
-        else:
-            add_inventory(
-                user_id,
-                {
-                    "name": prize["name"],
-                    "type": prize["type"],
-                    "time": int(time.time()),
-                },
-            )
-
-        save_history(user_id, case, prize, price)
-
-        text = f"""
-<b>🎉 ВЫИГРЫШ!</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🎁 Кейс: <b>{case['name']}</b>
-
-🏆 Приз:
-<b>{prize['name']}</b>
-"""
-
-        if prize.get("type") == "stars":
-            text += f"\n⭐ Зачислено: <b>{prize['stars']}</b>"
-
-        text += f"\n\n💰 Баланс: <b>{get_balance(user_id)}</b> ⭐"
-
-        bot.send_message(
-            call.message.chat.id,
-            text,
-            reply_markup=main_keyboard(user_id),
-        )
-
-        if prize.get("valuable"):
-            notify_admins_win(
-                user_id,
-                call.from_user.username,
-                case["name"],
-                prize["name"],
-            )
-    finally:
-        lock.release()
-
-
-# ============================================================
-# COLOR GAME
-# ============================================================
-
-def play_color(call, selected):
-    user_id = call.from_user.id
-
-    with state_lock:
-        state = states.get(user_id)
-
-    if not state or state.get("state") != "color_game":
-        bot.answer_callback_query(
-            call.id,
-            "❌ Эта игра уже завершена",
-            show_alert=True,
-        )
-        return
-
-    if selected not in {"red", "blue", "yellow"}:
-        return
-
-    with state_lock:
-        states.pop(user_id, None)
-
-    names = {
-        "red": "🔴 Красный",
-        "blue": "🔵 Синий",
-        "yellow": "🟡 Жёлтый",
-    }
-
-    winning_color = random.choice(list(names.keys()))
-
-    if selected == winning_color:
-        prize = {
-            "name": "🎁 NFT",
-            "type": "NFT",
-            "valuable": True,
-        }
-
-        add_inventory(
-            user_id,
-            {
-                "name": prize["name"],
-                "type": "NFT",
-                "time": int(time.time()),
-            },
-        )
-
-        case = case_info("colors")
-        if case:
-            save_history(user_id, case, prize, 100)
-
-        bot.send_message(
-            call.message.chat.id,
-            f"""
-<b>🎉 ПОБЕДА!</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-Правильный цвет:
-<b>{names[winning_color]}</b>
-
-🎁 Ты получил:
-<b>NFT</b>
-""",
-            reply_markup=main_keyboard(user_id),
-        )
-
-        notify_admins_win(
-            user_id,
-            call.from_user.username,
-            "🔴🔵🟡 Цвет",
-            "🎁 NFT",
-        )
-    else:
-        bot.send_message(
-            call.message.chat.id,
-            f"""
-<b>💥 ПРОИГРЫШ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-NFT находился в:
-<b>{names[winning_color]}</b>
-
-Ты выбрал:
-<b>{names[selected]}</b>
-
-🍀 Повезёт в следующий раз.
-""",
-            reply_markup=main_keyboard(user_id),
-        )
-
-
-# ============================================================
-# STATE HELPERS
-# ============================================================
-
-def set_state(user_id, state, **extra):
-    with state_lock:
-        states[user_id] = {"state": state, **extra}
-
-
-def pop_state(user_id):
-    with state_lock:
-        return states.pop(user_id, None)
-
-
-# ============================================================
-# TEXT HANDLER
-# ============================================================
-
-@bot.message_handler(content_types=["text"])
-def text_handler(message):
-    user_id = message.from_user.id
-    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
-
-    with state_lock:
-        state = dict(states.get(user_id, {}))
-
-    current_state = state.get("state")
-    if not current_state:
-        return
-
-    text = message.text.strip()
-
-    # RISK
-    if current_state == "risk_bet":
-        try:
-            bet = int(text)
-        except ValueError:
-            bot.send_message(
-                message.chat.id,
-                "❌ Введи целое число, например <code>100</code>.",
-            )
-            return
-
-        if bet <= 0:
-            bot.send_message(message.chat.id, "❌ Ставка должна быть больше 0.")
-            return
-
-        if bet > get_balance(user_id):
-            bot.send_message(message.chat.id, "❌ Недостаточно ⭐.")
-            return
-
-        if change_balance(user_id, -bet) is None:
-            bot.send_message(message.chat.id, "❌ Не удалось списать ставку.")
-            return
-
-        win = random.random() < 0.5
-
-        if win:
-            reward = bet * 2
-            change_balance(user_id, reward)
-
-            result = f"""
-<b>🍬 ИРИСКА — ПОБЕДА!</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🎯 Ставка: <b>{bet}</b> ⭐
-🎉 Выплата: <b>{reward}</b> ⭐
-
-💰 Баланс: <b>{get_balance(user_id)}</b> ⭐
-"""
-        else:
-            result = f"""
-<b>💥 ИРИСКА — ПРОИГРЫШ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🎯 Ставка: <b>{bet}</b> ⭐
-❌ Потеряно: <b>{bet}</b> ⭐
-
-💰 Баланс: <b>{get_balance(user_id)}</b> ⭐
-"""
-
-        pop_state(user_id)
-
-        bot.send_message(
-            message.chat.id,
-            result,
-            reply_markup=main_keyboard(user_id),
-        )
-        return
-
-    # ADMIN ADD
-    if current_state == "admin_add":
-        if user_id not in ADMINS:
-            pop_state(user_id)
-            return
-
-        parts = text.split()
-        if len(parts) != 2:
-            bot.send_message(message.chat.id, "Формат: <code>ID количество</code>")
-            return
-
-        try:
-            target_id = int(parts[0])
-            amount = int(parts[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ ID и количество должны быть числами.")
-            return
+        user_id = int(parts[1])
+        amount = int(parts[2])
 
         if amount <= 0:
-            bot.send_message(message.chat.id, "❌ Количество должно быть больше 0.")
-            return
+            raise ValueError
 
-        ensure_user(target_id)
-        new_balance = change_balance(target_id, amount, allow_negative=True)
+    except ValueError:
 
-        pop_state(user_id)
-
-        bot.send_message(
-            message.chat.id,
-            f"""
-<b>✅ ЗВЁЗДЫ ВЫДАНЫ</b>
-
-👤 ID: <code>{target_id}</code>
-➕ <b>{amount}</b> ⭐
-💰 Новый баланс: <b>{new_balance}</b> ⭐
-""",
-            reply_markup=admin_keyboard(),
+        bot.reply_to(
+            message,
+            "❌ Неверный ID или сумма."
         )
 
+        return
+
+    try:
+
+        new_balance = add_balance(
+            user_id,
+            -amount,
+            "admin_take",
+            f"Админ {message.from_user.id}"
+        )
+
+    except ValueError:
+
+        bot.reply_to(
+            message,
+            "❌ Недостаточно ⭐."
+        )
+
+        return
+
+    bot.reply_to(
+        message,
+
+        f"✅ Списано "
+        f"<b>{money(amount)} ⭐</b>\n\n"
+
+        f"Баланс: "
+        f"<b>{money(new_balance)} ⭐</b>"
+    )
+
+    try:
+
+        bot.send_message(
+            user_id,
+
+            "⚠️ <b>Списание</b>\n\n"
+
+            f"Списано: "
+            f"<b>{money(amount)} ⭐</b>\n\n"
+
+            f"Баланс: "
+            f"<b>{money(new_balance)} ⭐</b>"
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# USER INFO
+# ============================================================
+
+@bot.message_handler(
+    commands=["user"]
+)
+def admin_user(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    parts = message.text.split()
+
+    if (
+        len(parts) != 2
+        or not parts[1].isdigit()
+    ):
+
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "<code>/user ID</code>"
+        )
+
+        return
+
+    user_id = int(parts[1])
+
+    row = get_user(user_id)
+
+    if not row:
+
+        bot.reply_to(
+            message,
+            "❌ Игрок не найден."
+        )
+
+        return
+
+    items = get_inventory(
+        user_id
+    )
+
+    bot.reply_to(
+        message,
+
+        "👤 <b>Игрок</b>\n\n"
+
+        f"🆔 ID: "
+        f"<code>{row['id']}</code>\n"
+
+        f"👤 Username: "
+        f"@{row['username'] or 'нет'}\n"
+
+        f"📛 Имя: "
+        f"{row['first_name'] or 'нет'}\n\n"
+
+        f"💰 Баланс: "
+        f"<b>{money(row['balance'])} ⭐</b>\n"
+
+        f"🎒 NFT ожидают выдачи: "
+        f"<b>{len(items)}</b>"
+    )
+
+
+# ============================================================
+# PENDING NFT
+# ============================================================
+
+@bot.message_handler(
+    commands=["nft_pending"]
+)
+def nft_pending(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    rows = get_pending_nfts()
+
+    if not rows:
+
+        bot.reply_to(
+            message,
+            "✅ NFT, ожидающих выдачи, нет."
+        )
+
+        return
+
+    text = (
+        "🎒 <b>NFT ожидают выдачи:</b>\n\n"
+    )
+
+    for row in rows:
+
+        text += (
+            f"🆔 <code>#{row['id']}</code>\n"
+
+            f"👤 Игрок: "
+            f"{user_label(row)}\n"
+
+            f"🆔 User ID: "
+            f"<code>{row['user_id']}</code>\n"
+
+            f"🎁 NFT: "
+            f"<b>{row['nft_name']}</b>\n"
+
+            f"📦 Кейс: "
+            f"{row['source_case']}\n\n"
+
+            f"Для подтверждения:\n"
+            f"<code>/nft_done {row['id']}</code>\n"
+
+            "━━━━━━━━━━━━\n"
+        )
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+
+# ============================================================
+# NFT DONE
+# ============================================================
+
+@bot.message_handler(
+    commands=["nft_done"]
+)
+def nft_done(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    parts = message.text.split()
+
+    if (
+        len(parts) != 2
+        or not parts[1].isdigit()
+    ):
+
+        bot.reply_to(
+            message,
+
+            "Использование:\n"
+            "<code>/nft_done ID</code>"
+        )
+
+        return
+
+    nft_id = int(parts[1])
+
+    row = deliver_nft(
+        nft_id
+    )
+
+    if not row:
+
+        bot.reply_to(
+            message,
+
+            "❌ NFT не найден "
+            "или уже выдан."
+        )
+
+        return
+
+    user_id, nft_name = row
+
+    bot.reply_to(
+        message,
+
+        "✅ <b>NFT отмечен как выданный.</b>\n\n"
+
+        f"🎁 {nft_name}\n"
+        f"🆔 #{nft_id}"
+    )
+
+    try:
+
+        bot.send_message(
+            user_id,
+
+            "🎉 <b>NFT выдан!</b>\n\n"
+
+            f"🎁 Предмет: "
+            f"<b>{nft_name}</b>\n"
+
+            f"🆔 Inventory ID: "
+            f"<code>#{nft_id}</code>\n\n"
+
+            "Администратор подтвердил "
+            "фактическую выдачу NFT."
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+@bot.message_handler(
+    commands=["stats"]
+)
+def stats(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    users, stars, pending, opens = get_stats()
+
+    bot.reply_to(
+        message,
+
+        "📊 <b>Статистика</b>\n\n"
+
+        f"👥 Игроков: "
+        f"<b>{users}</b>\n"
+
+        f"⭐ Всего на балансах: "
+        f"<b>{money(stars)}</b>\n"
+
+        f"🎒 NFT ожидают выдачи: "
+        f"<b>{pending}</b>\n"
+
+        f"🎁 Всего открытий: "
+        f"<b>{opens}</b>"
+    )
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+@bot.message_handler(
+    commands=["broadcast"]
+)
+def broadcast(message):
+
+    if not is_admin(
+        message.from_user
+    ):
+
+        bot.reply_to(
+            message,
+            "⛔ Нет доступа."
+        )
+
+        return
+
+    text = message.text.partition(
+        " "
+    )[2].strip()
+
+    if not text:
+
+        bot.reply_to(
+            message,
+
+            "Использование:\n"
+            "<code>/broadcast Ваш текст</code>"
+        )
+
+        return
+
+    with db() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT id
+                FROM users
+                """
+            )
+
+            user_ids = [
+                row[0]
+                for row in cur.fetchall()
+            ]
+
+    sent = 0
+    failed = 0
+
+    for user_id in user_ids:
+
         try:
+
             bot.send_message(
-                target_id,
-                f"⭐ Вам начислено <b>+{amount}</b> ⭐\n"
-                f"Баланс: <b>{new_balance}</b> ⭐",
+                user_id,
+                text
             )
+
+            sent += 1
+
         except Exception:
-            pass
-        return
 
-    # ADMIN REMOVE
-    if current_state == "admin_remove":
-        if user_id not in ADMINS:
-            pop_state(user_id)
-            return
+            failed += 1
 
-        parts = text.split()
-        if len(parts) != 2:
-            bot.send_message(message.chat.id, "Формат: <code>ID количество</code>")
-            return
+    bot.reply_to(
+        message,
 
-        try:
-            target_id = int(parts[0])
-            amount = int(parts[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ ID и количество должны быть числами.")
-            return
+        "📢 <b>Рассылка завершена.</b>\n\n"
 
-        if amount <= 0:
-            bot.send_message(message.chat.id, "❌ Количество должно быть больше 0.")
-            return
-
-        if not get_user(target_id):
-            bot.send_message(message.chat.id, "❌ Пользователь не найден.")
-            return
-
-        new_balance = change_balance(target_id, -amount)
-
-        if new_balance is None:
-            bot.send_message(message.chat.id, "❌ Недостаточно ⭐ у пользователя.")
-            return
-
-        pop_state(user_id)
-
-        bot.send_message(
-            message.chat.id,
-            f"""
-<b>✅ ЗВЁЗДЫ СНЯТЫ</b>
-
-👤 ID: <code>{target_id}</code>
-➖ <b>{amount}</b> ⭐
-💰 Новый баланс: <b>{new_balance}</b> ⭐
-""",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    # ADMIN USER
-    if current_state == "admin_user":
-        if user_id not in ADMINS:
-            pop_state(user_id)
-            return
-
-        try:
-            target_id = int(text)
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Отправь корректный Telegram ID.")
-            return
-
-        target = get_user(target_id)
-        if not target:
-            bot.send_message(message.chat.id, "❌ Пользователь не найден.")
-            return
-
-        inventory = get_inventory(target_id)
-
-        pop_state(user_id)
-
-        bot.send_message(
-            message.chat.id,
-            f"""
-<b>👤 ПОЛЬЗОВАТЕЛЬ</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🆔 ID: <code>{target_id}</code>
-👤 Username: @{target['username'] if target['username'] else 'нет'}
-
-⭐ Баланс: <b>{target['stars']}</b>
-🎒 Предметов: <b>{len(inventory)}</b>
-""",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    # BROADCAST
-    if current_state == "broadcast":
-        if user_id not in ADMINS:
-            pop_state(user_id)
-            return
-
-        users = get_all_users()
-        success = 0
-        failed = 0
-
-        for target_id in users:
-            try:
-                bot.send_message(target_id, text)
-                success += 1
-            except Exception:
-                failed += 1
-            time.sleep(0.03)
-
-        pop_state(user_id)
-
-        bot.send_message(
-            message.chat.id,
-            f"""
-<b>📢 РАССЫЛКА ЗАВЕРШЕНА</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-✅ Успешно: <b>{success}</b>
-❌ Ошибок: <b>{failed}</b>
-""",
-            reply_markup=admin_keyboard(),
-        )
-        return
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}"
+    )
 
 
 # ============================================================
-# ERRORS / POLLING
+# FALLBACK
 # ============================================================
 
-def safe_polling():
-    while True:
-        try:
-            print("=" * 50)
-            print("CASE BOT STARTING")
-            print("DATABASE:", "configured")
-            print("ADMINS:", ADMINS)
-            print("=" * 50)
+@bot.message_handler(
+    func=lambda message: True
+)
+def fallback(message):
 
-            init_db()
+    ensure_user(
+        message.from_user
+    )
 
-            bot.infinity_polling(
-                skip_pending=True,
-                timeout=30,
-                long_polling_timeout=30,
-            )
+    bot.send_message(
+        message.chat.id,
 
-        except Exception as e:
-            print("BOT ERROR:", repr(e))
-            print("Restarting in 5 seconds...")
-            time.sleep(5)
+        "Используй кнопки меню 👇",
 
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# START BOT
+# ============================================================
 
 if __name__ == "__main__":
-    safe_polling()
+
+    init_db()
+
+    logging.info(
+        "================================="
+    )
+
+    logging.info(
+        "Wavegram Cases Bot started"
+    )
+
+    logging.info(
+        "API: %s",
+        API_URL
+    )
+
+    logging.info(
+        "Admins: %s",
+        sorted(ADMIN_IDS)
+    )
+
+    logging.info(
+        "================================="
+    )
+
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30,
+        allowed_updates=[
+            "message",
+            "callback_query"
+        ]
+    )
