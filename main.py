@@ -5,7 +5,6 @@ import random
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.bot import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
@@ -26,6 +25,7 @@ from sqlalchemy import (
     Text,
     func,
     select,
+    text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -35,33 +35,34 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Если твой сервер совместим с Telegram Bot API:
 API_HOST = os.getenv(
     "API_HOST",
     "http://31.76.20.193:8081",
 ).strip()
 
-BILETER_PRICE = int(
-    os.getenv("BILETER_PRICE", "100")
-)
 
-LUXURY_PRICE = int(
-    os.getenv("LUXURY_PRICE", "2000")
-)
+# Цены кейсов
+BILETER_PRICE = 100
+LUXURY_PRICE = 2000
 
-# Поставь нужную цену Наркомана на Railway.
+# Укажи цену Наркомана через Railway Variables:
+# NARKOMAN_PRICE=100
 NARKOMAN_PRICE = int(
-    os.getenv("NARKOMAN_PRICE", "0")
+    os.getenv("NARKOMAN_PRICE", "100")
 )
 
+
+# ============================================================
+# АДМИНЫ
+# ============================================================
 
 ADMIN_IDS = {
     1780243345,
@@ -70,22 +71,22 @@ ADMIN_IDS = {
 }
 
 
-# =========================================================
-# CHECK CONFIG
-# =========================================================
+# ============================================================
+# ПРОВЕРКА НАСТРОЕК
+# ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN не задан"
+        "Не задан BOT_TOKEN"
     )
 
 if not DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL не задан"
+        "Не задан DATABASE_URL"
     )
 
 
-# Railway иногда выдаёт postgres://
+# Railway иногда отдаёт postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
@@ -101,9 +102,23 @@ elif DATABASE_URL.startswith("postgresql://"):
     )
 
 
-# =========================================================
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
+)
+
+
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
 engine = create_async_engine(
     DATABASE_URL,
@@ -121,7 +136,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# ============================================================
+# USER
+# ============================================================
+
 class User(Base):
+
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(
@@ -158,7 +178,12 @@ class User(Base):
     )
 
 
+# ============================================================
+# CASE OPEN
+# ============================================================
+
 class CaseOpen(Base):
+
     __tablename__ = "case_opens"
 
     id: Mapped[int] = mapped_column(
@@ -209,7 +234,12 @@ class CaseOpen(Base):
     )
 
 
+# ============================================================
+# INVENTORY
+# ============================================================
+
 class InventoryItem(Base):
+
     __tablename__ = "inventory_items"
 
     id: Mapped[int] = mapped_column(
@@ -251,7 +281,12 @@ class InventoryItem(Base):
     )
 
 
+# ============================================================
+# BALANCE LOG
+# ============================================================
+
 class BalanceLog(Base):
+
     __tablename__ = "balance_logs"
 
     id: Mapped[int] = mapped_column(
@@ -293,12 +328,12 @@ class BalanceLog(Base):
     )
 
 
-# =========================================================
-# CASE REWARDS
-# =========================================================
+# ============================================================
+# НАГРАДЫ
+# ============================================================
 
-# Вес определяет вероятность.
-# Гарантированных наград НЕТ.
+# Вес = вероятность.
+# Никаких гарантированных наград нет.
 
 BILETER_REWARDS = [
     (
@@ -309,7 +344,7 @@ BILETER_REWARDS = [
     ),
     (
         "Золотой билет",
-        "item",
+        "nft",
         20,
         0,
     ),
@@ -320,7 +355,7 @@ LUXURY_REWARDS = [
     (
         "Wavegram Gift #1",
         "gift",
-        300,
+        350,
         0,
     ),
     (
@@ -332,7 +367,7 @@ LUXURY_REWARDS = [
     (
         "Wavegram Gift #3",
         "gift",
-        200,
+        180,
         0,
     ),
     (
@@ -344,7 +379,7 @@ LUXURY_REWARDS = [
     (
         "Очень редкий Wavegram Gift",
         "gift",
-        100,
+        70,
         0,
     ),
 ]
@@ -371,36 +406,16 @@ def choose_reward(rewards):
     return random.choices(
         rewards,
         weights=[
-            x[2]
-            for x in rewards
+            reward[2]
+            for reward in rewards
         ],
         k=1,
     )[0]
 
 
-# =========================================================
+# ============================================================
 # TELEGRAM API
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(message)s"
-    ),
-)
-
-
-logging.info(
-    "API_HOST = %s",
-    API_HOST,
-)
-
-
-# ВАЖНО:
-# сервер должен поддерживать стандартные методы
-# Telegram Bot API.
+# ============================================================
 
 telegram_api = TelegramAPIServer.from_base(
     API_HOST
@@ -413,17 +428,263 @@ telegram_session = AiohttpSession(
 bot = Bot(
     token=BOT_TOKEN,
     session=telegram_session,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
 )
 
 dp = Dispatcher()
 
 
-# =========================================================
-# DATABASE INIT
-# =========================================================
+# ============================================================
+# DATABASE MIGRATION
+# ============================================================
+
+async def migrate_database():
+
+    """
+    Исправляет старую таблицу users.
+
+    Основная проблема из логов:
+    users существует, но users.id отсутствует.
+
+    Эта функция:
+    - проверяет users;
+    - переименовывает user_id/telegram_id в id;
+    - либо создаёт id;
+    - добавляет отсутствующие колонки;
+    - создаёт остальные таблицы.
+    """
+
+    async with engine.begin() as conn:
+
+        # --------------------------------------------------------
+        # Список таблиц
+        # --------------------------------------------------------
+
+        result = await conn.execute(
+            text("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+            """)
+        )
+
+        tables = {
+            row[0]
+            for row in result.fetchall()
+        }
+
+        # --------------------------------------------------------
+        # USERS
+        # --------------------------------------------------------
+
+        if "users" in tables:
+
+            result = await conn.execute(
+                text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'users'
+                """)
+            )
+
+            columns = {
+                row[0]
+                for row in result.fetchall()
+            }
+
+            logging.info(
+                "Существующие колонки users: %s",
+                sorted(columns),
+            )
+
+            # ----------------------------------------------------
+            # user_id -> id
+            # ----------------------------------------------------
+
+            if (
+                "id" not in columns
+                and "user_id" in columns
+            ):
+
+                logging.warning(
+                    "Миграция users.user_id -> users.id"
+                )
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        RENAME COLUMN user_id TO id
+                    """)
+                )
+
+                columns.remove("user_id")
+                columns.add("id")
+
+            # ----------------------------------------------------
+            # telegram_id -> id
+            # ----------------------------------------------------
+
+            elif (
+                "id" not in columns
+                and "telegram_id" in columns
+            ):
+
+                logging.warning(
+                    "Миграция users.telegram_id -> users.id"
+                )
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        RENAME COLUMN telegram_id TO id
+                    """)
+                )
+
+                columns.remove("telegram_id")
+                columns.add("id")
+
+            # ----------------------------------------------------
+            # Если вообще нет ID
+            # ----------------------------------------------------
+
+            elif "id" not in columns:
+
+                logging.warning(
+                    "В users отсутствует ID."
+                )
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN id BIGINT
+                    """)
+                )
+
+                # Получаем существующие строки
+                result = await conn.execute(
+                    text("""
+                        SELECT ctid
+                        FROM users
+                        WHERE id IS NULL
+                    """)
+                )
+
+                rows = result.fetchall()
+
+                next_id = 1
+
+                for row in rows:
+
+                    await conn.execute(
+                        text("""
+                            UPDATE users
+                            SET id = :id
+                            WHERE ctid = :ctid
+                        """),
+                        {
+                            "id": next_id,
+                            "ctid": row[0],
+                        },
+                    )
+
+                    next_id += 1
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ALTER COLUMN id SET NOT NULL
+                    """)
+                )
+
+                # Проверяем primary key
+                result = await conn.execute(
+                    text("""
+                        SELECT constraint_name
+                        FROM information_schema.table_constraints
+                        WHERE table_schema = 'public'
+                          AND table_name = 'users'
+                          AND constraint_type = 'PRIMARY KEY'
+                    """)
+                )
+
+                has_pk = (
+                    result.first()
+                    is not None
+                )
+
+                if not has_pk:
+
+                    await conn.execute(
+                        text("""
+                            ALTER TABLE users
+                            ADD PRIMARY KEY (id)
+                        """)
+                    )
+
+            # ----------------------------------------------------
+            # Остальные колонки
+            # ----------------------------------------------------
+
+            if "username" not in columns:
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN username VARCHAR(255)
+                    """)
+                )
+
+            if "first_name" not in columns:
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN first_name VARCHAR(255)
+                    """)
+                )
+
+            if "balance" not in columns:
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN balance BIGINT
+                        NOT NULL DEFAULT 0
+                    """)
+                )
+
+            if "is_admin" not in columns:
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN is_admin BOOLEAN
+                        NOT NULL DEFAULT FALSE
+                    """)
+                )
+
+            if "created_at" not in columns:
+
+                await conn.execute(
+                    text("""
+                        ALTER TABLE users
+                        ADD COLUMN created_at TIMESTAMP
+                        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    """)
+                )
+
+        # --------------------------------------------------------
+        # Остальные таблицы
+        # --------------------------------------------------------
+
+        await conn.run_sync(
+            Base.metadata.create_all
+        )
+
+    logging.info(
+        "PostgreSQL migration: OK"
+    )
+
 
 async def init_database():
 
@@ -431,26 +692,47 @@ async def init_database():
 
         try:
 
-            async with engine.begin() as connection:
+            await migrate_database()
 
-                await connection.run_sync(
-                    Base.metadata.create_all
-                )
+            # ----------------------------------------------------
+            # Проверяем администраторов
+            # ----------------------------------------------------
+
+            async with SessionLocal() as db:
+
+                for admin_id in ADMIN_IDS:
+
+                    result = await db.execute(
+                        select(User).where(
+                            User.id == admin_id
+                        )
+                    )
+
+                    user = (
+                        result.scalar_one_or_none()
+                    )
+
+                    if user:
+
+                        user.is_admin = True
+
+                await db.commit()
 
             logging.info(
-                "PostgreSQL: OK"
+                "Администраторы проверены."
             )
 
             return True
 
         except Exception as error:
 
-            logging.error(
-                "PostgreSQL error: %s",
+            logging.exception(
+                "Ошибка PostgreSQL: %s",
                 error,
             )
 
             if attempt == 14:
+
                 return False
 
             await asyncio.sleep(3)
@@ -458,9 +740,9 @@ async def init_database():
     return False
 
 
-# =========================================================
-# GET / CREATE USER
-# =========================================================
+# ============================================================
+# USER
+# ============================================================
 
 async def get_or_create_user(
     db: AsyncSession,
@@ -511,9 +793,9 @@ async def get_or_create_user(
     return user
 
 
-# =========================================================
+# ============================================================
 # MENUS
-# =========================================================
+# ============================================================
 
 def main_menu():
 
@@ -551,7 +833,7 @@ def cases_menu():
                 InlineKeyboardButton(
                     text=(
                         f"🎫 Билитер "
-                        f"({BILETER_PRICE} ⭐)"
+                        f"— {BILETER_PRICE} ⭐"
                     ),
                     callback_data="case:bileter",
                 )
@@ -560,7 +842,7 @@ def cases_menu():
                 InlineKeyboardButton(
                     text=(
                         f"💎 Лакшери "
-                        f"({LUXURY_PRICE} ⭐)"
+                        f"— {LUXURY_PRICE} ⭐"
                     ),
                     callback_data="case:luxury",
                 )
@@ -569,14 +851,14 @@ def cases_menu():
                 InlineKeyboardButton(
                     text=(
                         f"💊 Наркоман "
-                        f"({NARKOMAN_PRICE} ⭐)"
+                        f"— {NARKOMAN_PRICE} ⭐"
                     ),
                     callback_data="case:narkoman",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔴🔵🟡 Цвет",
+                    text="🔴🔵🟡 Красный / Синий / Жёлтый",
                     callback_data="case:color",
                 )
             ],
@@ -606,12 +888,12 @@ def back_menu(
     )
 
 
-# =========================================================
-# ADMIN NOTIFICATION
-# =========================================================
+# ============================================================
+# ADMIN NOTIFICATIONS
+# ============================================================
 
 async def notify_admins(
-    text
+    message_text
 ):
 
     for admin_id in ADMIN_IDS:
@@ -620,21 +902,21 @@ async def notify_admins(
 
             await bot.send_message(
                 chat_id=admin_id,
-                text=text,
+                text=message_text,
             )
 
         except Exception as error:
 
             logging.error(
-                "Ошибка уведомления %s: %s",
+                "Ошибка отправки админу %s: %s",
                 admin_id,
                 error,
             )
 
 
-# =========================================================
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
 @dp.message(CommandStart())
 async def start_command(
@@ -642,7 +924,7 @@ async def start_command(
 ):
 
     logging.info(
-        "/start от %s",
+        "Получен /start от %s",
         message.from_user.id,
     )
 
@@ -663,6 +945,7 @@ async def start_command(
             "Telegram Stars.\n\n"
             "Выбери действие:",
             reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML,
         )
 
     except Exception as error:
@@ -673,32 +956,14 @@ async def start_command(
         )
 
         await message.answer(
-            "⚠️ Произошла ошибка. "
-            "Попробуй ещё раз."
+            "⚠️ Произошла ошибка.\n\n"
+            "Попробуй ещё раз через несколько секунд."
         )
 
 
-# =========================================================
-# /START ALSO AS TEXT COMMAND
-# =========================================================
-
-@dp.message(
-    F.text.regexp(
-        r"^/start(?:\s+.*)?$"
-    )
-)
-async def start_fallback(
-    message: Message
-):
-
-    await start_command(
-        message
-    )
-
-
-# =========================================================
+# ============================================================
 # HOME
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "home"
@@ -715,9 +980,9 @@ async def home(
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # PROFILE
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "profile"
@@ -743,17 +1008,16 @@ async def profile(
         "👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{user.id}</code>\n"
         f"👤 Username: {username}\n"
-        f"⭐ Баланс: "
-        f"<b>{user.balance}</b>",
+        f"⭐ Баланс: <b>{user.balance}</b>",
         reply_markup=main_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # CASES
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "cases"
@@ -764,8 +1028,7 @@ async def cases(
 
     await callback.message.edit_text(
         "🎁 <b>Кейсы</b>\n\n"
-        "Все награды выпадают "
-        "случайно.\n\n"
+        "Награда определяется случайно.\n"
         "❗ Гарантированных наград нет.",
         reply_markup=cases_menu(),
     )
@@ -773,9 +1036,9 @@ async def cases(
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # DEPOSIT
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "deposit"
@@ -786,27 +1049,24 @@ async def deposit(
 
     await callback.message.edit_text(
         "💰 <b>Пополнение</b>\n\n"
-        "Внутреннюю валюту для кейсов "
-        "можно приобрести за настоящие "
-        "Telegram Stars у:\n\n"
+        "Валюту для кейсов можно приобрести "
+        "за настоящие Telegram Stars у:\n\n"
         "• @doxme\n"
         "• @modeevil\n"
         "• @bogkm\n\n"
-        "После пополнения администратор "
-        "может выдать игровые ⭐ через "
-        "админ-команду.\n\n"
-        "⚠️ Игровые ⭐ внутри бота "
-        "не являются настоящими "
-        "Telegram Stars.",
+        "После покупки игровые ⭐ выдаются "
+        "администратором.\n\n"
+        "⚠️ ⭐ внутри бота — игровая валюта "
+        "и не являются настоящими Telegram Stars.",
         reply_markup=back_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # INVENTORY
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "inventory"
@@ -833,45 +1093,50 @@ async def inventory(
 
     if not items:
 
-        text = (
-            "📦 <b>Инвентарь пуст</b>"
+        await callback.message.edit_text(
+            "📦 <b>Инвентарь пуст.</b>",
+            reply_markup=back_menu(),
         )
 
-    else:
+        await callback.answer()
 
-        lines = [
-            "📦 <b>Инвентарь</b>\n"
-        ]
+        return
 
-        for item in items:
+    lines = [
+        "📦 <b>Инвентарь</b>\n"
+    ]
 
-            if item.status == "pending":
-                status = "⏳ Ожидает выдачи"
+    for item in items:
 
-            elif item.status == "issued":
-                status = "✅ Выдано"
+        if item.status == "pending":
 
-            else:
-                status = item.status
+            status = "⏳ Ожидает выдачи"
 
-            lines.append(
-                f"• {item.item_name}\n"
-                f"  {status}"
-            )
+        elif item.status == "issued":
 
-        text = "\n".join(lines)
+            status = "✅ Выдано"
+
+        else:
+
+            status = item.status
+
+        lines.append(
+            f"#{item.id} — "
+            f"{item.item_name}\n"
+            f"Статус: {status}"
+        )
 
     await callback.message.edit_text(
-        text,
+        "\n".join(lines),
         reply_markup=back_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # ADD INVENTORY
-# =========================================================
+# ============================================================
 
 async def add_inventory(
     db,
@@ -892,9 +1157,9 @@ async def add_inventory(
     )
 
 
-# =========================================================
+# ============================================================
 # CHARGE BALANCE
-# =========================================================
+# ============================================================
 
 async def charge_balance(
     db,
@@ -921,9 +1186,9 @@ async def charge_balance(
     return user
 
 
-# =========================================================
+# ============================================================
 # OPEN CASE
-# =========================================================
+# ============================================================
 
 async def open_case(
     callback,
@@ -959,16 +1224,21 @@ async def open_case(
         reward_type = reward[1]
         reward_value = reward[3]
 
+        # ----------------------------------------------------
+        # Денежная игровая награда
+        # ----------------------------------------------------
+
         if reward_type == "balance":
 
-            user.balance += (
-                reward_value
-            )
+            user.balance += reward_value
+
+        # ----------------------------------------------------
+        # NFT / Gift / редкий предмет
+        # ----------------------------------------------------
 
         elif reward_type in {
-            "item",
-            "gift",
             "nft",
+            "gift",
         }:
 
             await add_inventory(
@@ -978,6 +1248,10 @@ async def open_case(
                 reward_type,
                 case_name,
             )
+
+        # ----------------------------------------------------
+        # История открытия
+        # ----------------------------------------------------
 
         db.add(
             CaseOpen(
@@ -1000,9 +1274,9 @@ async def open_case(
         )
 
 
-# =========================================================
+# ============================================================
 # BILETER
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "case:bileter"
@@ -1030,7 +1304,7 @@ async def bileter(
 
     if reward_type == "balance":
 
-        text = (
+        text_result = (
             "🎫 <b>Билитер открыт!</b>\n\n"
             f"🎁 {reward_name}\n"
             f"⭐ +{reward_value}\n\n"
@@ -1039,11 +1313,10 @@ async def bileter(
 
     else:
 
-        text = (
+        text_result = (
             "🎫 <b>Билитер открыт!</b>\n\n"
             f"✨ <b>{reward_name}</b>\n\n"
-            "Предмет добавлен "
-            "в инвентарь."
+            "Предмет добавлен в инвентарь."
         )
 
         await notify_admins(
@@ -1058,16 +1331,16 @@ async def bileter(
         )
 
     await callback.message.edit_text(
-        text,
+        text_result,
         reply_markup=cases_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # LUXURY
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "case:luxury"
@@ -1096,14 +1369,12 @@ async def luxury(
     await callback.message.edit_text(
         "💎 <b>Лакшери открыт!</b>\n\n"
         f"🎁 <b>{reward_name}</b>\n\n"
-        "Предмет добавлен "
-        "в инвентарь.\n\n"
-        f"Баланс: <b>{balance} ⭐</b>",
+        "Предмет добавлен в инвентарь.",
         reply_markup=cases_menu(),
     )
 
     await notify_admins(
-        "💎 <b>Открыт Лакшери</b>\n\n"
+        "💎 <b>Выпала награда из Лакшери</b>\n\n"
         f"ID: <code>"
         f"{callback.from_user.id}"
         f"</code>\n"
@@ -1115,9 +1386,9 @@ async def luxury(
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # NARKOMAN
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "case:narkoman"
@@ -1145,7 +1416,7 @@ async def narkoman(
 
     if reward_type == "balance":
 
-        text = (
+        text_result = (
             "💊 <b>Наркоман открыт!</b>\n\n"
             f"🎁 {reward_name}\n\n"
             f"Баланс: <b>{balance} ⭐</b>"
@@ -1153,11 +1424,10 @@ async def narkoman(
 
     else:
 
-        text = (
+        text_result = (
             "💊 <b>Наркоман открыт!</b>\n\n"
             f"✨ <b>{reward_name}</b>\n\n"
-            "Предмет добавлен "
-            "в инвентарь."
+            "Предмет добавлен в инвентарь."
         )
 
         await notify_admins(
@@ -1172,16 +1442,16 @@ async def narkoman(
         )
 
     await callback.message.edit_text(
-        text,
+        text_result,
         reply_markup=cases_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # COLOR CASE
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data == "case:color"
@@ -1197,10 +1467,14 @@ async def color_case(
                     text="🔴 Красный",
                     callback_data="color:red",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🔵 Синий",
                     callback_data="color:blue",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🟡 Жёлтый",
                     callback_data="color:yellow",
@@ -1210,7 +1484,7 @@ async def color_case(
                 InlineKeyboardButton(
                     text="⬅️ Назад",
                     callback_data="cases",
-                )
+                ),
             ],
         ]
     )
@@ -1226,9 +1500,9 @@ async def color_case(
     await callback.answer()
 
 
-# =========================================================
+# ============================================================
 # COLOR RESULT
-# =========================================================
+# ============================================================
 
 @dp.callback_query(
     F.data.startswith("color:")
@@ -1250,7 +1524,7 @@ async def color_result(
         ]
     )
 
-    names = {
+    color_names = {
         "red": "🔴 Красный",
         "blue": "🔵 Синий",
         "yellow": "🟡 Жёлтый",
@@ -1298,14 +1572,13 @@ async def color_result(
 
     if selected == winning:
 
-        text = (
+        result_text = (
             "🎉 <b>ПОБЕДА!</b>\n\n"
             f"Твой цвет: "
-            f"{names[selected]}\n"
+            f"{color_names[selected]}\n"
             f"Выигрышный: "
-            f"{names[winning]}\n\n"
-            "✨ NFT добавлен "
-            "в инвентарь."
+            f"{color_names[winning]}\n\n"
+            "✨ NFT добавлен в инвентарь."
         )
 
         await notify_admins(
@@ -1315,41 +1588,39 @@ async def color_result(
             f"</code>\n"
             f"Username: "
             f"@{callback.from_user.username or 'нет'}\n"
-            f"Цвет: {names[winning]}"
+            f"Цвет: {color_names[winning]}"
         )
 
     else:
 
-        text = (
+        result_text = (
             "😔 <b>Проигрыш</b>\n\n"
             f"Твой цвет: "
-            f"{names[selected]}\n"
+            f"{color_names[selected]}\n"
             f"Выигрышный цвет: "
-            f"{names[winning]}"
+            f"{color_names[winning]}"
         )
 
     await callback.message.edit_text(
-        text,
+        result_text,
         reply_markup=cases_menu(),
     )
 
     await callback.answer()
 
 
-# =========================================================
-# ADMIN
-# =========================================================
+# ============================================================
+# ADMIN CHECK
+# ============================================================
 
-def is_admin(
-    user_id
-):
+def is_admin(user_id):
 
     return user_id in ADMIN_IDS
 
 
-# =========================================================
+# ============================================================
 # /STATS
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("stats")
@@ -1362,40 +1633,36 @@ async def stats(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
 
+        return
+
     async with SessionLocal() as db:
 
-        users = await db.scalar(
+        users_count = await db.scalar(
             select(
                 func.count(User.id)
             )
         )
 
-        cases = await db.scalar(
+        cases_count = await db.scalar(
             select(
-                func.count(
-                    CaseOpen.id
-                )
+                func.count(CaseOpen.id)
             )
         )
 
-        items = await db.scalar(
+        items_count = await db.scalar(
             select(
-                func.count(
-                    InventoryItem.id
-                )
+                func.count(InventoryItem.id)
             )
         )
 
-        balance = await db.scalar(
+        total_balance = await db.scalar(
             select(
                 func.coalesce(
-                    func.sum(
-                        User.balance
-                    ),
+                    func.sum(User.balance),
                     0,
                 )
             )
@@ -1404,19 +1671,19 @@ async def stats(
     await message.answer(
         "📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: "
-        f"<b>{users}</b>\n"
+        f"<b>{users_count}</b>\n"
         f"🎁 Открытий: "
-        f"<b>{cases}</b>\n"
+        f"<b>{cases_count}</b>\n"
         f"📦 Предметов: "
-        f"<b>{items}</b>\n"
-        f"⭐ Игровых ⭐: "
-        f"<b>{balance}</b>"
+        f"<b>{items_count}</b>\n"
+        f"⭐ Общий баланс: "
+        f"<b>{total_balance}</b>"
     )
 
 
-# =========================================================
+# ============================================================
 # /GIVE
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("give")
@@ -1429,37 +1696,38 @@ async def give(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
+
+        return
 
     parts = message.text.split()
 
     if len(parts) != 3:
 
-        return await message.answer(
+        await message.answer(
             "Использование:\n"
             "<code>/give ID СУММА</code>"
         )
 
+        return
+
     try:
 
-        user_id = int(
-            parts[1]
-        )
-
-        amount = int(
-            parts[2]
-        )
+        user_id = int(parts[1])
+        amount = int(parts[2])
 
         if amount <= 0:
             raise ValueError
 
     except ValueError:
 
-        return await message.answer(
+        await message.answer(
             "❌ Неверные данные."
         )
+
+        return
 
     async with SessionLocal() as db:
 
@@ -1475,9 +1743,11 @@ async def give(
 
         if user is None:
 
-            return await message.answer(
+            await message.answer(
                 "❌ Пользователь не найден."
             )
+
+            return
 
         user.balance += amount
 
@@ -1494,16 +1764,16 @@ async def give(
         await db.commit()
 
     await message.answer(
-        "✅ <b>Готово</b>\n\n"
-        f"Игрок: <code>{user_id}</code>\n"
+        "✅ <b>Звёзды выданы</b>\n\n"
+        f"ID: <code>{user_id}</code>\n"
         f"Выдано: <b>+{amount} ⭐</b>\n"
         f"Баланс: <b>{user.balance} ⭐</b>"
     )
 
 
-# =========================================================
+# ============================================================
 # /TAKE
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("take")
@@ -1516,37 +1786,38 @@ async def take(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
+
+        return
 
     parts = message.text.split()
 
     if len(parts) != 3:
 
-        return await message.answer(
+        await message.answer(
             "Использование:\n"
             "<code>/take ID СУММА</code>"
         )
 
+        return
+
     try:
 
-        user_id = int(
-            parts[1]
-        )
-
-        amount = int(
-            parts[2]
-        )
+        user_id = int(parts[1])
+        amount = int(parts[2])
 
         if amount <= 0:
             raise ValueError
 
     except ValueError:
 
-        return await message.answer(
+        await message.answer(
             "❌ Неверные данные."
         )
+
+        return
 
     async with SessionLocal() as db:
 
@@ -1562,22 +1833,28 @@ async def take(
 
         if user is None:
 
-            return await message.answer(
+            await message.answer(
                 "❌ Пользователь не найден."
             )
 
-        actual = min(
-            amount,
-            user.balance,
-        )
+            return
 
-        user.balance -= actual
+        if user.balance < amount:
+
+            await message.answer(
+                f"❌ У игрока только "
+                f"<b>{user.balance} ⭐</b>."
+            )
+
+            return
+
+        user.balance -= amount
 
         db.add(
             BalanceLog(
                 user_id=user.id,
                 admin_id=message.from_user.id,
-                amount=-actual,
+                amount=-amount,
                 balance_after=user.balance,
                 operation="take",
             )
@@ -1586,16 +1863,16 @@ async def take(
         await db.commit()
 
     await message.answer(
-        "✅ <b>Готово</b>\n\n"
-        f"Игрок: <code>{user_id}</code>\n"
-        f"Снято: <b>-{actual} ⭐</b>\n"
+        "✅ <b>Звёзды сняты</b>\n\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Снято: <b>-{amount} ⭐</b>\n"
         f"Баланс: <b>{user.balance} ⭐</b>"
     )
 
 
-# =========================================================
+# ============================================================
 # /INVENTORY
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("inventory")
@@ -1608,38 +1885,41 @@ async def admin_inventory(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
+
+        return
 
     parts = message.text.split()
 
     if len(parts) != 2:
 
-        return await message.answer(
+        await message.answer(
             "Использование:\n"
             "<code>/inventory ID</code>"
         )
 
+        return
+
     try:
 
-        user_id = int(
-            parts[1]
-        )
+        user_id = int(parts[1])
 
     except ValueError:
 
-        return await message.answer(
+        await message.answer(
             "❌ Неверный ID."
         )
+
+        return
 
     async with SessionLocal() as db:
 
         result = await db.execute(
             select(InventoryItem)
             .where(
-                InventoryItem.user_id
-                == user_id
+                InventoryItem.user_id == user_id
             )
             .order_by(
                 InventoryItem.id.desc()
@@ -1651,30 +1931,33 @@ async def admin_inventory(
 
     if not items:
 
-        return await message.answer(
+        await message.answer(
             "📦 Инвентарь пуст."
         )
 
-    text = (
-        "📦 <b>Инвентарь</b>\n\n"
-    )
+        return
+
+    lines = [
+        "📦 <b>Инвентарь игрока</b>\n"
+    ]
 
     for item in items:
 
-        text += (
-            f"#{item.id} "
-            f"{item.item_name} "
-            f"— {item.status}\n"
+        lines.append(
+            f"#{item.id} — "
+            f"{item.item_name}\n"
+            f"Тип: {item.item_type}\n"
+            f"Статус: {item.status}\n"
         )
 
     await message.answer(
-        text
+        "\n".join(lines)
     )
 
 
-# =========================================================
+# ============================================================
 # /ISSUE
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("issue")
@@ -1687,9 +1970,11 @@ async def issue(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
+
+        return
 
     parts = message.text.split(
         maxsplit=2
@@ -1697,22 +1982,25 @@ async def issue(
 
     if len(parts) < 2:
 
-        return await message.answer(
+        await message.answer(
             "Использование:\n"
-            "<code>/issue ITEM_ID</code>"
+            "<code>/issue ITEM_ID"
+            "</code>"
         )
+
+        return
 
     try:
 
-        item_id = int(
-            parts[1]
-        )
+        item_id = int(parts[1])
 
     except ValueError:
 
-        return await message.answer(
-            "❌ Неверный ID."
+        await message.answer(
+            "❌ Неверный ID предмета."
         )
+
+        return
 
     note = (
         parts[2]
@@ -1725,8 +2013,7 @@ async def issue(
         result = await db.execute(
             select(InventoryItem)
             .where(
-                InventoryItem.id
-                == item_id
+                InventoryItem.id == item_id
             )
             .with_for_update()
         )
@@ -1735,9 +2022,11 @@ async def issue(
 
         if item is None:
 
-            return await message.answer(
+            await message.answer(
                 "❌ Предмет не найден."
             )
+
+            return
 
         item.status = "issued"
         item.admin_note = note
@@ -1750,9 +2039,9 @@ async def issue(
     )
 
 
-# =========================================================
+# ============================================================
 # /ADMIN
-# =========================================================
+# ============================================================
 
 @dp.message(
     Command("admin")
@@ -1765,27 +2054,29 @@ async def admin_help(
         message.from_user.id
     ):
 
-        return await message.answer(
+        await message.answer(
             "❌ Нет доступа."
         )
 
+        return
+
     await message.answer(
-        "🛠 <b>Админ-панель</b>\n\n"
+        "🛠 <b>Админ-команды</b>\n\n"
         "/stats — статистика\n"
         "/give ID СУММА — выдать ⭐\n"
         "/take ID СУММА — снять ⭐\n"
-        "/inventory ID — инвентарь\n"
-        "/issue ITEM_ID — выдать предмет\n"
+        "/inventory ID — инвентарь игрока\n"
+        "/issue ITEM_ID — отметить предмет выданным\n"
         "/admin — список команд"
     )
 
 
-# =========================================================
-# ERROR HANDLER
-# =========================================================
+# ============================================================
+# ОБРАБОТЧИК ОШИБОК
+# ============================================================
 
 @dp.errors()
-async def global_error_handler(
+async def error_handler(
     event
 ):
 
@@ -1795,14 +2086,14 @@ async def global_error_handler(
     )
 
 
-# =========================================================
-# START BOT
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
 
     logging.info(
-        "================================"
+        "===================================="
     )
 
     logging.info(
@@ -1810,38 +2101,33 @@ async def main():
     )
 
     logging.info(
-        "API: %s",
+        "API_HOST: %s",
         API_HOST,
     )
 
-    # -----------------------------------------------------
-    # Проверяем БД
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
 
-    database_ok = (
-        await init_database()
-    )
+    database_ok = await init_database()
 
     if not database_ok:
 
-        logging.error(
-            "База данных недоступна."
-        )
-
         raise RuntimeError(
-            "DATABASE_URL недоступен"
+            "Не удалось подключиться "
+            "к PostgreSQL"
         )
 
-    # -----------------------------------------------------
-    # Проверяем Telegram API
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # TELEGRAM API
+    # --------------------------------------------------------
 
     try:
 
         me = await bot.get_me()
 
         logging.info(
-            "Telegram API OK"
+            "Telegram API: OK"
         )
 
         logging.info(
@@ -1850,26 +2136,22 @@ async def main():
         )
 
         logging.info(
-            "ID бота: %s",
+            "Bot ID: %s",
             me.id,
         )
 
     except Exception as error:
 
         logging.exception(
-            "НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ "
-            "К TELEGRAM API"
+            "Telegram API error: %s",
+            error,
         )
 
-        logging.error(
-            "Проверь BOT_TOKEN и API_HOST."
-        )
+        raise
 
-        raise error
-
-    # -----------------------------------------------------
-    # Polling
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # POLLING
+    # --------------------------------------------------------
 
     try:
 
@@ -1892,9 +2174,9 @@ async def main():
         await engine.dispose()
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -1910,9 +2192,11 @@ if __name__ == "__main__":
             "Бот остановлен."
         )
 
-    except Exception:
+    except Exception as error:
 
         logging.exception(
-            "КРИТИЧЕСКАЯ ОШИБКА БОТА"
+            "Критическая ошибка: %s",
+            error,
         )
+
         raise
