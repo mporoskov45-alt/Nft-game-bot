@@ -58,6 +58,7 @@ LUXURY_PRICE = 2000
 NARKOMAN_PRICE = int(
     os.getenv("NARKOMAN_PRICE", "100")
 )
+COLOR_PRICE = 100
 
 
 # ============================================================
@@ -797,32 +798,14 @@ async def get_or_create_user(
 # MENUS
 # ============================================================
 
-def main_menu():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎁 Кейсы",
-                    callback_data="cases",
-                ),
-                InlineKeyboardButton(
-                    text="👤 Профиль",
-                    callback_data="profile",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Пополнение",
-                    callback_data="deposit",
-                ),
-                InlineKeyboardButton(
-                    text="📦 Инвентарь",
-                    callback_data="inventory",
-                ),
-            ],
-        ]
-    )
+def main_menu(is_admin=False):
+    rows = [
+        [InlineKeyboardButton(text="🎁 Кейсы", callback_data="cases"), InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="💰 Пополнение", callback_data="deposit"), InlineKeyboardButton(text="📦 Инвентарь", callback_data="inventory")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="🛡 Админ-панель", callback_data="admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cases_menu():
@@ -858,7 +841,7 @@ def cases_menu():
             ],
             [
                 InlineKeyboardButton(
-                    text="🔴🔵🟡 Красный / Синий / Жёлтый",
+                    text=f"🎨 Цветной кейс — {COLOR_PRICE} ⭐",
                     callback_data="case:color",
                 )
             ],
@@ -886,6 +869,18 @@ def back_menu(
             ]
         ]
     )
+
+
+# ============================================================
+# ADMIN MENU
+# ============================================================
+def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"), InlineKeyboardButton(text="🧾 Команды", callback_data="admin:help")],
+        [InlineKeyboardButton(text="➕ Выдать ⭐", callback_data="admin:give"), InlineKeyboardButton(text="➖ Снять ⭐", callback_data="admin:take")],
+        [InlineKeyboardButton(text="📦 Инвентарь игрока", callback_data="admin:inventory")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+    ])
 
 
 # ============================================================
@@ -944,7 +939,7 @@ async def start_command(
             "Они не являются настоящими "
             "Telegram Stars.\n\n"
             "Выбери действие:",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(callback.from_user.id in ADMIN_IDS),
             parse_mode=ParseMode.HTML,
         )
 
@@ -974,7 +969,7 @@ async def home(
 
     await callback.message.edit_text(
         "🎮 <b>Главное меню</b>",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(callback.from_user.id in ADMIN_IDS),
     )
 
     await callback.answer()
@@ -1009,7 +1004,7 @@ async def profile(
         f"🆔 ID: <code>{user.id}</code>\n"
         f"👤 Username: {username}\n"
         f"⭐ Баланс: <b>{user.balance}</b>",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(message.from_user.id in ADMIN_IDS),
     )
 
     await callback.answer()
@@ -1504,110 +1499,64 @@ async def color_case(
 # COLOR RESULT
 # ============================================================
 
-@dp.callback_query(
-    F.data.startswith("color:")
-)
-async def color_result(
-    callback: CallbackQuery
-):
-
-    selected = callback.data.split(
-        ":",
-        1,
-    )[1]
-
-    winning = random.choice(
-        [
-            "red",
-            "blue",
-            "yellow",
-        ]
-    )
-
-    color_names = {
-        "red": "🔴 Красный",
-        "blue": "🔵 Синий",
-        "yellow": "🟡 Жёлтый",
-    }
-
+@dp.callback_query(F.data.startswith("color:"))
+async def color_result(callback: CallbackQuery):
+    selected = callback.data.split(":", 1)[1]
+    colors = {"red":"🔴 Красный", "blue":"🔵 Синий", "yellow":"🟡 Жёлтый"}
     async with SessionLocal() as db:
-
-        await get_or_create_user(
-            db,
-            callback.from_user,
-        )
-
+        user = await charge_balance(db, callback.from_user.id, COLOR_PRICE)
+        if user is None:
+            await db.rollback(); await callback.answer("❌ Недостаточно ⭐", show_alert=True); return
+        winning = random.choice(list(colors))
         if selected == winning:
-
-            reward_name = "NFT"
-            reward_type = "nft"
-
-            await add_inventory(
-                db,
-                callback.from_user.id,
-                reward_name,
-                reward_type,
-                "Цвет",
-            )
-
+            reward_name, reward_type = "NFT", "nft"
+            await add_inventory(db, user.id, reward_name, reward_type, "Цветной кейс")
+            text_result = f"🎉 <b>ПОБЕДА!</b>\n\nТвой цвет: {colors[selected]}\nВыигрышный: {colors[winning]}\n\n✨ NFT добавлен в инвентарь.\n💰 Баланс: <b>{user.balance} ⭐</b>"
         else:
-
-            reward_name = "Проигрыш"
-            reward_type = "lose"
-
-        db.add(
-            CaseOpen(
-                user_id=callback.from_user.id,
-                case_name="Цвет",
-                price=0,
-                selected_color=selected,
-                winning_color=winning,
-                reward_name=reward_name,
-                reward_type=reward_type,
-                reward_value=0,
-            )
-        )
-
+            reward_name, reward_type = "Проигрыш", "lose"
+            text_result = f"😔 <b>Проигрыш</b>\n\nТвой цвет: {colors[selected]}\nВыигрышный цвет: {colors[winning]}\n\n💰 Баланс: <b>{user.balance} ⭐</b>"
+        db.add(CaseOpen(user_id=user.id, case_name="Цветной кейс", price=COLOR_PRICE, selected_color=selected, winning_color=winning, reward_name=reward_name, reward_type=reward_type, reward_value=0))
         await db.commit()
-
     if selected == winning:
-
-        result_text = (
-            "🎉 <b>ПОБЕДА!</b>\n\n"
-            f"Твой цвет: "
-            f"{color_names[selected]}\n"
-            f"Выигрышный: "
-            f"{color_names[winning]}\n\n"
-            "✨ NFT добавлен в инвентарь."
-        )
-
-        await notify_admins(
-            "🚨 <b>Выпал NFT!</b>\n\n"
-            f"ID: <code>"
-            f"{callback.from_user.id}"
-            f"</code>\n"
-            f"Username: "
-            f"@{callback.from_user.username or 'нет'}\n"
-            f"Цвет: {color_names[winning]}"
-        )
-
-    else:
-
-        result_text = (
-            "😔 <b>Проигрыш</b>\n\n"
-            f"Твой цвет: "
-            f"{color_names[selected]}\n"
-            f"Выигрышный цвет: "
-            f"{color_names[winning]}"
-        )
-
-    await callback.message.edit_text(
-        result_text,
-        reply_markup=cases_menu(),
-    )
-
+        await notify_admins(f"🚨 <b>Выпал NFT!</b>\n\nID: <code>{callback.from_user.id}</code>\nUsername: @{callback.from_user.username or 'нет'}\nКейс: Цветной — {colors[winning]}")
+    await callback.message.edit_text(text_result, reply_markup=cases_menu())
     await callback.answer()
 
+
+# ============================================================
+# ADMIN CALLBACKS
+# ============================================================
+@dp.callback_query(F.data == "admin")
+async def admin_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    await callback.message.edit_text("🛡 <b>Панель администратора</b>\n\nВыберите действие:", reply_markup=admin_menu()); await callback.answer()
+
+@dp.callback_query(F.data == "admin:stats")
+async def admin_stats_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    async with SessionLocal() as db:
+        u=await db.scalar(select(func.count(User.id))) or 0; c=await db.scalar(select(func.count(CaseOpen.id))) or 0; i=await db.scalar(select(func.count(InventoryItem.id))) or 0; b=await db.scalar(select(func.coalesce(func.sum(User.balance),0))) or 0
+    await callback.message.edit_text(f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{u}</b>\n🎁 Открытий: <b>{c}</b>\n📦 Предметов: <b>{i}</b>\n⭐ Общий баланс: <b>{b}</b>", reply_markup=admin_menu()); await callback.answer()
+
+@dp.callback_query(F.data == "admin:give")
+async def admin_give_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    await callback.message.edit_text("➕ <b>Выдача ⭐</b>\n\nИспользуйте команду:\n<code>/give ID СУММА</code>", reply_markup=admin_menu()); await callback.answer()
+
+@dp.callback_query(F.data == "admin:take")
+async def admin_take_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    await callback.message.edit_text("➖ <b>Снятие ⭐</b>\n\nИспользуйте команду:\n<code>/take ID СУММА</code>", reply_markup=admin_menu()); await callback.answer()
+
+@dp.callback_query(F.data == "admin:inventory")
+async def admin_inventory_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    await callback.message.edit_text("📦 <b>Инвентарь игрока</b>\n\nИспользуйте команду:\n<code>/inventory ID</code>", reply_markup=admin_menu()); await callback.answer()
+
+@dp.callback_query(F.data == "admin:help")
+async def admin_help_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): await callback.answer("❌ Нет доступа", show_alert=True); return
+    await callback.message.edit_text("🛠 <b>Команды</b>\n\n/stats — статистика\n/give ID СУММА — выдать ⭐\n/take ID СУММА — снять ⭐\n/inventory ID — инвентарь\n/issue ITEM_ID — выдать предмет", reply_markup=admin_menu()); await callback.answer()
 
 # ============================================================
 # ADMIN CHECK
@@ -2060,15 +2009,7 @@ async def admin_help(
 
         return
 
-    await message.answer(
-        "🛠 <b>Админ-команды</b>\n\n"
-        "/stats — статистика\n"
-        "/give ID СУММА — выдать ⭐\n"
-        "/take ID СУММА — снять ⭐\n"
-        "/inventory ID — инвентарь игрока\n"
-        "/issue ITEM_ID — отметить предмет выданным\n"
-        "/admin — список команд"
-    )
+    await message.answer("🛡 <b>Панель администратора</b>\n\nВыберите действие:", reply_markup=admin_menu())
 
 
 # ============================================================
